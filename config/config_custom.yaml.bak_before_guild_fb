@@ -1,0 +1,49 @@
+bot:
+  jump_attack: false
+  map: yezhulingtu
+  mode: smart_patrol
+directional_attack:
+  cooldown: 0.4
+  range_x: 130
+  range_y: 80
+health_monitor:
+  add_hp_percent: 30
+  add_mp_percent: 10
+hybrid_attack:
+  aoe_cooldown: 0.5
+nametag:
+  enable: true
+  layers: 3
+  name: 日丁
+  offset:
+  - 0
+  - 24
+  reacquire_after_misses: 2
+  search_margin: 200
+  dual_template: true
+  verify_on_reacquire: true
+  verify_diff_thres: 0.28
+  scan_every_n_frames: 3
+  occluded_diff_thres: 0.4
+  occluded_plate_support: 0.22
+  hold_good_frames: 12
+  hold_good_score_max: 0.12
+  max_jump_y: 30
+  jump_reject_score: 0.15
+  verify_require_track_score: 0.18
+shutdown_monitor:
+  lost_seconds: 120
+  timed_at: 05:00
+monster_detect:
+  mode: contour_only
+  diff_thres: 0.8
+  template_name_prefixes:
+  - stand
+  - move
+  template_max_files_per_monster: 10
+  detect_every_n_frames: 1
+  with_enemy_hp_bar: true
+  hp_bar_color:
+  - 71
+  - 204
+  - 64

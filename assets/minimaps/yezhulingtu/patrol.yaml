@@ -1,0 +1,7 @@
+map: yezhulingtu
+range:
+- 0.406
+- 0.622
+preferred_y: null
+preferred_y_tol: 12.0
+rope_enable: false

@@ -1,0 +1,19 @@
+eng_to_cn:
+  yezhulingtu: yezhulingtu
+  yezhudelingdi: yezhudelingdi
+  野猪: 野猪
+  duoluozhuyi-xia: duoluozhuyi-xia
+  duoluozhuyi: duoluozhuyi
+map_mobs_mapping:
+  duoluozhuyi-xia:
+  - 三眼章鱼
+  - 蓝蘑菇
+  duoluozhuyi:
+  - 三眼章鱼
+  - 蓝蘑菇
+  yezhulingtu:
+  - 野猪
+  - 黑斧木妖
+  yezhudelingdi:
+  - 野猪
+  - 黑斧木妖

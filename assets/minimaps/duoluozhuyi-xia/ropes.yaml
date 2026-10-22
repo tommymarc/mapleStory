@@ -1,0 +1,6 @@
+# Record climbs with: python tools/ropeRecorder.py --map duoluozhuyi-xia
+# Or UI Record tab -> 录绳子. Do not invent coordinates by hand.
+map: duoluozhuyi-xia
+preferred_y: null
+preferred_y_tol: 12
+edges: []

@@ -1,0 +1,445 @@
+# ====== Default Configuration ======
+# DO NOT directly modify the following parameters
+# Put your own setting in config_edit_me.yaml instead.
+# --------------------------------------
+
+bot:
+  # 馃攣 Bot Settings
+  mode: "normal"        # Options: "normal" "aux" "patrol" "smart_patrol"
+  attack: "directional" # Options: "aoe_skill" "directional" "hybrid"
+  map: "" # Please refer to config/config_data.yaml
+
+key:
+  # 馃幃 Keyboard Mapping
+  # Adjust the keys to match your in-game keybindings.
+  #
+  # Examples:
+  #   - "q":      Presses key Q
+  #   - "space":  Space bar
+  #   - "1":      Number key 1
+  #   - "ctrl":   Control key
+  #   - "alt":    Alt key
+  #   - "shift":  Shift key
+  aoe_skill: "q"            # 馃挜 AoE skill (e.g., Cleric's heal or Mage's lightning)
+  directional_attack: "w"   # 鈿旓笍 Basic directional attack (e.g., Magic Claw or throwing stars)
+  teleport: "e"             # 馃寑 Teleport skill. Set to "" if not usable
+  jump: "space"             # 馃 Jump key
+  add_hp: "1"               # 鉂わ笍 Use HP potion. Set to "" to disable auto-healing
+  add_mp: "2"               # 馃挧 Use MP potion. Set to "" to disable auto-mana
+  return_home: "home"       # 馃攣 Key to use return home scroll.
+  party: "p"                # 鈱笍 Party window shortcut
+
+buff_skill:
+  # 馃挮 Buff Skill
+  # Automatically apply buff skills when the cooldowns are ready.
+  # Buff skills are like: Mage's Magic Guard, Cleric's Angel's Blessing, Thief's Speed Boost
+  # 鈿狅笍 Note: If your have a pet to apply buff for you, you can ignore this.
+  keys: []                # 鈱笍 List of keys to cast each buff skill (e.g., ["a", "s"])
+  cooldown: []            # 鈴憋笍 Cooldown time (in seconds), matches the order of `keys`
+  action_cooldown: 1      # 馃晵 Delay (in seconds) after buffing before continuing actions
+
+directional_attack:
+  # 馃棥锔?Directional Attack
+  # Directional attacks are basic attack/skills that only attack player left or right.
+  # For examples, Mage鈥檚 Magic Claw, Thief鈥檚 dart throw, or even a snail shell toss are all directional attack
+  range_x: 350               # 鈫旓笍 Horizontal attack range (in pixels)
+  range_y: 70                # 鈫曪笍 Vertical attack range (in pixels)
+  cooldown: 0.9              # 鈴憋笍 Time between attacks (in seconds)
+  character_turn_delay: 0.06 # 馃攧 Delay after turning before attacking (in seconds)
+
+combat:
+  # Engage-hold: finish a kill through brief vision flicker instead of walking away
+  engage_hold_sec: 1.2                 # Keep attacking same side after a hit (seconds)
+  # Single miss grace: empty while engaging -> stand+pulse for this long, then clear
+  engage_miss_grace_sec: 0.35
+  engage_miss_grace_kill_sec: 0.35     # Kept equal for single-tier / backward compat
+  engage_miss_grace_flicker_sec: 0.35  # Kept equal for single-tier / backward compat
+  # Soft monster tracks: off by default for stability (decision_monsters = live only)
+  monster_track_enable: false
+  monster_track_ttl_sec: 0.4             # Keep soft/ghost box after miss (seconds)
+  monster_track_match_dist: 80           # Max center distance (px) to associate across frames
+  monster_track_soft_when_live_max: 1    # If live count > this, ignore soft for directional decisions
+  engage_side_sticky: true               # Keep engage_side until miss grace / no targets on that side
+  # Hit reaction: disabled by default for stability
+  hit_react_enable: false
+  hit_react_min_drop_percent: 4.0
+  hit_react_duration_sec: 0.4
+  hit_react_cooldown_sec: 1.3
+  hit_react_jump: true
+
+
+recovery:
+  # Stuck / off-route recovery: pause combat, navigate back to route, then halt
+  # if recovery fails for too long. Prevents Hybrid AoE + jump spam while lost.
+  enable: true
+  pause_attack: true          # Skip aoe_attack / directional attack while recovering
+  prefer_route: true          # On stuck, try update_cmd_by_route toward route/GOAL first
+  random_after_sec: 8         # Only fall back to softened random after this many seconds in recovery
+  halt_after_sec: 45          # Halt bot if still stuck / minimap player missing this long
+  minimap_lost_sec: 3         # Treat missing minimap player marker as recovery after this grace
+  random_allow_jump: false    # Softened random: left/right move, no jump by default
+  random_reissue_sec: 1.5     # Re-roll random move at most this often while recovering
+  min_duration_sec: 6         # Stay in recovery at least this long (pause attacks)
+  clear_stuck_grace_sec: 3    # Require continuous not-stuck this long before Recovered
+
+hybrid_attack:
+  # 鈿旓笍 Mixed combat: use directional main attack for one target and AoE for crowds.
+  aoe_trigger_count: 2       # 馃懃 Number of independent monsters required for AoE
+  aoe_cooldown: 0.9          # 鈴憋笍 Independent cooldown for the AoE key
+
+aoe_skill:
+  # 馃挜 AoE Skill
+  # AoE (Area of Effect) skills hit enemies no matter which direction the chrarcter is facing.
+  # For examples: Cleric鈥檚 Heal, Holy light, Mage鈥檚 Lightning Bolt are all AOE skills 
+  range_x: 400               # 鈫旓笍 Horizontal skill range (in pixels)
+  range_y: 170               # 鈫曪笍 Vertical skill range (in pixels)
+  cooldown: 0.05             # TODO: Currently just a filler
+
+health_monitor:
+  # 鉂わ笍 Health Monitor
+  # Automatically drinks HP/MP potions when health or mana drops below a threshold.
+  # 鈿狅笍 If your pet already handles auto-healing, you can disable this.
+  enable: True             # 鉁?Enable or disable health monitor
+  force_heal: False        # 馃洝锔?Heal first 鈥?stop attacking until HP is restored
+  add_hp_percent: 50       # 鉂わ笍 Drink HP potion when HP drops below this ratio [0.0 ~ 1.0]
+  add_mp_percent: 50       # 馃挋 Drink MP potion when MP drops below this ratio [0.0 ~ 1.0]
+  potion_profile:
+    enable: false              # true only after dialog enable+save
+    add_hp_percent_min: 35     # trigger HP heal when <= min%
+    add_hp_percent_max: 70     # heal toward this HP%
+    add_hp_potion_amount: 300  # absolute HP restored per press (e.g. 100/150/300/1000)
+    add_hp_max: 0              # character max HP; 0 => single-press fallback
+    add_mp_percent_min: 20     # trigger MP when <= min%
+    add_mp_percent_max: 60     # restore toward this MP%
+    add_mp_potion_amount: 150  # absolute MP restored per press
+    add_mp_max: 0              # character max MP; 0 => single-press fallback
+    add_hp_max_presses: 5      # clamp presses per HP burst
+    add_mp_max_presses: 5      # clamp presses per MP burst
+    add_hp_press_interval: 0.15
+    add_mp_press_interval: 0.15
+  add_hp_cooldown: 0.5     # 馃晵 Seconds to wait between HP potions, prevent potion spam
+  add_mp_cooldown: 0.5     # 馃晵 Seconds to wait between MP potions, prevent potion spam
+  fps_limit: 20            # 馃殽 Loop rate for the health monitor thread
+  return_home_if_no_potion: False      # 鉁?Use homing scroll when potion is used up
+  return_home_watch_dog_timeout: 3     # 馃晵 Duration to detect HP is lower than "add_hp_percent"
+
+teleport:
+  # 馃寑 Mage Teleport
+  # This feature lets Mages use teleport to move faster while walking.
+  # 鈿狅笍 Still experimental! Enabling it may cause unexpected issues.
+  is_use_teleport_to_walk: False  # 鉁?Use teleport while walking (may cause inaccurate pathing)
+  cooldown: 1                     # 鈴憋笍 Teleport skill cooldown (in seconds)
+
+edge_teleport:
+  # 馃鈥嶁檪锔?Edge Teleport
+  # When your character approaches the edge of a platform, teleport to the platform center.
+  # If your character isn't a Mage, it will perform a jump instead.
+  enable: True                 # 鉁?Enable or disable this feature
+  trigger_box_width: 20        # 鈫旓笍 Width of the edge detection box (in pixels)
+  trigger_box_height: 10       # 鈫曪笍 Height of the edge detection box (in pixels)
+  color_code: [255, 127, 127]  # 馃帹 RGB color code to represent platform edge
+
+party_red_bar:
+  # 鉂わ笍 Party Red Bar Detection
+  # Detects your character's party red on on the game window to estimate player location.
+  # This feature will only turn on when nametag.enable == False
+  enable: False            # 鉁?Enable only for game versions that expose the party red bar
+  lower_red: [0, 60, 60]   # 鉂わ笍 HSV, darker red of party health bar
+  upper_red: [0, 100, 100] # 鉂わ笍 HSV, brighter red of party health bar
+  offset: [20, 66]         # 馃幆 Offset from the top-left corner of the party red bar to the character center
+  create_party_button_cn_thres: 0.04   # 馃搹 threshold for create party button matching
+  create_party_button_eng_thres: 0.04 # 馃搹 threshold for create party button matching
+
+nametag:
+  # 馃彿锔?NameTag Recognition
+  # 鈿狅笍 This feature is deprecated, using party red bar is way better than detecting nametag.
+  # Detects your character's nametag on the game window to estimate player location.
+  enable: False   # 鉁?Only switch back to 'True' when party red bar detection doesn't work for you
+  name: "example" # Load nametag/<name>.png as nametag template
+  mode: "color"      # 馃И Comparison mode, Options: "color" "grayscale" "white_mask" "histogram_eq"
+  offset: [-50, 30]  # 馃幆 Pixel offset from the top-left corner of the matched nametag to the character center 
+  diff_thres: 0.18   # 馃搹 Maximum full-template SQDIFF score
+  search_top: 100    # 馃毇 Ignore top UI strip (minimap/party list)
+  search_margin: 200 # Local search radius around last match
+  reacquire_after_misses: 5 # 馃攣 Frames to wait before a new global search
+  skip_when_minimap_ok: True  # smart_patrol Scan/Return: skip nametag when minimap lock is good
+  scan_every_n_frames: 3      # 0 = skip entirely in Scan/Return; >0 = throttle
+  occluded_diff_thres: 0.40
+  occluded_plate_support: 0.22
+  dual_template: True  # track=1-layer, verify=full stack on reacquire
+  verify_on_reacquire: True
+  verify_diff_thres: 0.28
+  guild_fallback_enable: true
+  guild_fallback_after_misses: 2
+  # guild_offset: [0, 48]  # Optional override; else name.offset_y + guild_dy (guild plate is lower)
+  template_scales: [[0.95, 0.90], [0.95, 0.95], [1.0, 1.0]]
+
+player_detect:
+  # 馃Л Player Location Strategy
+  # auto: nametag -> party red bar (if enabled) -> last position -> screen anchor
+  mode: "auto"             # Options: "auto" "nametag" "party_red_bar" "screen_anchor"
+  fallback_to_last: True
+  screen_anchor_ratio: [0.5, 0.55]
+
+character:
+  # 馃 Character
+  # Your character's size in pixels.
+  # 鈿狅笍 Only used if monster_detect.mode is set to "template_free" 鈥?  #    you can ignore this if using other detection modes.
+  width: 100      # 鈫旓笍 Character width (in pixels)
+  height: 150     # 鈫曪笍 Character height (in pixels)
+
+monster_detect:
+  # 馃悓 Monster Detection
+  # Automatically detect monsters around your character.
+  # Detection mode determines the method used to find monsters.
+  # Modes ranked from most to least computational cost:
+  #   - "color"         (most accurate but slowest)
+  #   - "grayscale"     (slow)
+  #   - "contour_only"  (fast, contour-based, a good balance)
+  #   - "template_free" (lightest and fastest, but likely to have many wrong detection)
+  # 馃挕 Feel free to test different modes to find what works best for your setup.
+  mode: "contour_only"         # 馃 Options: "color" "grayscale" "contour_only" "template_free"
+  diff_thres: 0.8              # 馃搹 Diff threshold for template matching, [0.0 ~ 1.0] Lower = stricter match
+  search_box_margin: 50        # 鉃?Additional margin(in pixels) around the attack box for monster searching
+  contour_blur: 5              # 馃尗锔?Gaussian blur kernel size used for contour smoothing (in "contour_only" mode).
+  alpha_threshold: 32          # 馃幁 Minimum PNG alpha value treated as a visible monster pixel
+  template_scales: [1.0]       # 馃攳 Optional sprite scales, e.g. [1.0, 1.01, 1.02]
+  template_name_prefixes: ["stand", "move"]  # Living poses only (skip die/hit)
+  template_max_files_per_prefix: 3           # 3 stand + 3 move
+  template_max_files_per_monster: 6
+  detect_every_n_frames: 1
+  with_enemy_hp_bar: True      # Use the green HP bar (black outline) as an auxiliary locator
+  hp_bar_color: [0, 243, 0]    # Artale fill BGR; detector matches neon green + black roof, not exact color
+  max_mob_area_trigger: 1500   # 馃搹 How much does the mob need to overlap with attack range to be considered as a target
+
+channel_change:
+  # 馃攣 Auto change channel when other player detected
+  # "true": Change channel once other player is detected
+  # "pixel": Change channel once other player move set pixels in other_player_move_pixel
+  enable: False                # 鉁?  mode: "pixel"                # 馃 Options: "true" "pixel"
+  other_player_move_thres: 10  # 馃搹 only work in "pixel" mode
+
+scheduled_channel_switching:
+  # Schduel for channel swithcing
+  enable: False            # Enable this feature or not
+  interval_seconds: 1800   # Switch channel for every <interval_seconds> second
+
+ui_coords:
+  # 馃Л UI Coordinate
+  # Buttons and menu cooridinate in game window
+  # Expect all these coordinate is on orignal window size (get it from frame screenshot)
+  ui_y_start: 610                       # 馃搻 UI y start
+  "menu": [1140, 730]                   # 馃搻 Menu coordinate on game window UI
+  "channel": [1140, 666]                # 馃搻 Channel button coordinate
+  "random_channel": [877, 161]          # 馃搻 Random channel button in the channel selection menu
+  "random_channel_confirm": [585, 420]  # 馃搻 Confirm button after clicking channel switch
+  "select_character": [888, 275]        # 馃搻 Select character button during login
+  login_button_thres: 0.05              # 馃搹 threshold to detect a login button on game window
+  login_button_top_left: [838, 317]     # 馃搻 top left corner of login button search ragne
+  login_button_bottom_right: [940, 373] # 馃搻 bottom right corner of login button search ragne
+
+route:
+  # 馃Л Route Following
+  # The character follows a pre-defined route image (route*.png) using color-coded commands.
+  search_range: 10            # 馃攳 Radius (in pixels) to search for the nearest route color around the player
+  jump_down_cooldown: 3.0     # 鈴憋笍 Cooldown (in seconds) for 'jump down' action to prevent continuous descent
+
+  # 馃帹 Color-coded(RGB) actions for route navigation
+  # "<left-right command, up-down command, action>"
+  color_code:
+    "255,0,0": "left none none"         # 馃敶 Red
+    "0,0,255": "right none none"        # 馃數 Blue
+    "255,127,0": "left none jump"       # 馃煚 Orange
+    "0,255,255": "right none jump"      # 馃煢 Cyan
+    "127,255,0": "none down jump"       # 馃挌 Lime
+    "255,0,255": "none none jump"       # 馃挏 Magenta
+    "0,255,127": "stop stop stop"       # 馃煝 Light green
+    "255,255,0": "none none goal"       # 馃煥 Yellow
+    "255,0,127": "none up teleport"     # 馃尭 Pink
+    "127,0,255": "none down teleport"   # 馃煪 Purple
+    "0,127,0": "left none teleport"     # 馃煩 Dark green
+    "139,69,19": "right none teleport"  # 馃煫 Brown
+
+  # 馃帹 Color-coded(RGB) actions for up and down
+  color_code_up_down:
+    "127,127,127": "none up none"       # 鈿?Gray
+    "255,255,127": "none down none"     # 馃煛 Light yellow
+
+watchdog:
+  # 馃惗 Watchdog
+  # This feature monitors your character's movement.
+  # If the player stays in the same spot for too long, the watchdog will "bark"
+  # and trigger a random action (defined in `color_code`) to help break the stuck state.
+  # The other feature is last attack watch dog. It check if the player doesn't attack for too long.
+  # If so, consider the player is stuck and perform recovery action 
+  range: 10            # 馃ザ Movement threshold (in pixels). If the player moves less than this, it's considered stuck.
+  timeout: 28          # 鈴憋笍 Time limit (in seconds). If the player stays still for this long, a random action is triggered.
+  combat_grace_sec: 5  # Reset immobile clock while attacking / engage / AoE mobs nearby
+  last_attack_timeout: 1200 # 鈴?Maximum time (in seconds) to not perform attack action
+  last_attack_timeout_action: "change_channel" # 馃 Options: "go_home" "change_channel"
+
+rune_warning_cn:
+  # 鈿狅笍 Rune Warning Detection(Chinese)
+  # Detects the "Please remove the rune" message on screen.
+  # When this warning appears, the bot will pause combat and start searching for the rune instead.
+  top_left: [513, 137]        # 馃煢 Top-left corner of the rune warning message (img_frame coord)
+  bottom_right: [768, 177]    # 馃煡 Bottom-right corner of the rune warning (img_frame coord)
+  diff_thres: 0.15            # 馃搹 Matching threshold [0.0 ~ 1.0], higher = stricter match
+
+rune_warning_eng:
+  # 鈿狅笍 Rune Warning Detection(English)
+  # Detects the "Please remove the rune" message on screen.
+  # When this warning appears, the bot will pause combat and start searching for the rune instead.
+  top_left: [432, 145]        # 馃煢 Top-left corner of the rune warning message (img_frame coord)
+  bottom_right: [864, 171]    # 馃煡 Bottom-right corner of the rune warning (img_frame coord)
+  diff_thres: 0.15            # 馃搹 Matching threshold [0.0 ~ 1.0], higher = stricter match
+
+rune_enable_msg_cn:
+  # 鈿狅笍 Rune Enable Message(Chinese)
+  # Detects the "Runes has been create" message on screen
+  # When it appears, the bot will start detecting runes
+  top_left: [559, 57]     # 馃搻 top left coordinate of rune enable msg (img_frame coord)
+  bottom_right: [733, 87] # 馃搻 right bottom coordinate of rune enable msg (img_frame coord)
+  diff_thres: 0.15         # 馃搹 Match threshold [0.0 ~ 1.0], higher = stricter match
+
+rune_enable_msg_eng:
+  # 鈿狅笍 Rune Enable Message(English)
+  # Detects the "Runes has been create" message on screen
+  # When it appears, the bot will start detecting runes
+  top_left: [460, 60]     # 馃搻 top left coordinate of rune enable msg (img_frame coord)
+  bottom_right: [702, 83] # 馃搻 right bottom coordinate of rune enable msg (img_frame coord)
+  diff_thres: 0.15         # 馃搹 Match threshold [0.0 ~ 1.0], higher = stricter match
+
+rune_detect:
+  # 鉁?Rune Detection Box
+  # This detects the glowing purple rune on screen.
+  # The box determines how big of a region to search in the game screen.
+  box_width: 350              # 鈫旓笍 Width of the detection region
+  box_height: 150             # 鈫曪笍 Height of the detection region
+  diff_thres: 0.2             # 馃搹 Match threshold [0.0 ~ 1.0], higher = stricter match
+  debug     : False           # 馃攳 Draw rune boxes or not
+
+rune_find:
+  # 馃Л Rune-Finding Behavior
+  near_rune_duration: 10           # 馃晵 Duration to interact with rune when a positive detection occurs
+  rune_trigger_cooldown: 0.3       # 馃晵 Cooldown for 'up' key rune trigger
+  rune_trigger_distance_x: 20      # 鈫旓笍 only press 'up' when player distance(in pixel) to the rune is close enough.
+  rune_trigger_distance_y: 200     # 鈫曪笍 only press 'up' when player distance(in pixel) to the rune is close enough.
+
+rune_solver:
+  # 馃З Rune Mini-Game Solver
+  # When a rune is successfully triggered, a 4-arrow window game appears.
+  # The rune_solver will automatically detect and match the best arrow pattern,
+  # then press the correct direction key to solve the mini-game.
+  arrow_box_size: 80           # 馃搻 Arrow icon size in pixels (e.g., 75x75 box)
+  arrow_box_interval: 170      # 鈫旓笍 Distance between arrows (horizontal spacing in pixels)
+  arrow_box_coord: [355, 296]  # 馃幆 Top-left coordinate of the first (leftmost) arrow (img_frame coord)
+  arrow_box_diff_thres: 0.2    # 馃搹 Match threshold [0.0 ~ 1.0]
+                               #     鈫?If the match score of the first arrow is lower than this,
+                               #     the solver assumes the rune mini-game has started
+  arrow_low_hsv: [340, 40, 40]    # 馃敶
+  arrow_high_hsv: [110, 100, 100] # 馃敶
+  arrow_highlight_low_hsv: [340, 85, 85]    # 馃敶
+  arrow_highlight_high_hsv: [110, 100, 100] # 馃敶
+
+minimap:
+  # 馃椇锔?Mini-Map
+  # The minimap appears in the top-left corner of the game window.
+  # It is used to estimate the player鈥檚 current location in the world.
+  player_color: [0, 255, 255]     # 馃煛 Classic server player dot, BGR pure yellow
+  other_player_color: [0, 0, 255] # 馃敶 BGR value of the red other player dot on the minimap
+  debug_window_upscale: 2         # 馃攳 Zoom factor for the route debug image (for visualization only)
+  offset: [0, 0]                  # 馃搻 Don't set this unless playing on global server
+
+
+smart_patrol:
+  # Smart Patrol: Scan left/right via minimap, Engage when mobs appear,
+  # Return via recorded rope edges when off preferred band / no mobs (P2).
+  # No route PNGs required. Nametag still used for attack center.
+  range: [0.25, 0.75]         # Minimap x ratio bounds [0..1] where Scan turns around (safer cliffs)
+  turn_point_thres: 5         # Consecutive frames past bound before flipping direction
+  scan_turn_sec: 8.0          # Force flip Scan direction after this many seconds
+  engage_timeout_sec: 6.0     # Max time in Engage before returning to Scan
+  no_mob_turn_sec: 1.5        # Leave Engage / try rope after no combat target this long
+  # --- P2 rope / layer ---
+  rope_enable: true           # Use assets/minimaps/{map}/ropes.yaml for Return
+  rope_cooldown_sec: 8.0      # Min seconds between Return attempts
+  rope_approach_dist: 8.0     # Minimap px distance to treat rope start as reached
+  rope_arrive_dist: 10.0      # Minimap px distance to treat rope end as reached
+  rope_climb_timeout_sec: 6.0 # Max climb hold if duration_hint missing
+  preferred_y: null           # Optional preferred minimap y; null = use ropes.yaml / soft-lock
+  preferred_y_tol: 12         # Off-band if |player_y - preferred_y| > tol
+  preferred_y_autolock_sec: 3.0  # If preferred_y null: soft-lock after this many seconds of stable y while fighting
+  preferred_y_autolock_tol: 3.0  # Minimap px y jitter allowed while accumulating soft-lock
+  missing_rope_log_sec: 10.0  # When edges empty + no mobs: re-log rope-missing warning this often
+
+patrol:
+  # 馃毝鈥嶁檪锔?Patrol Mode
+  # In this mode, the player will walk back and forth and attack periodically.
+  # It doesn't rely on monster detection or a minimap 鈥?just pure action!
+  range: [0.2, 0.8]               # 鈫旓笍 [0.0 ~ 1.0] Patrol boundaries (relative to screen width)
+                                  #     - 0.0 = Left edge of the game window
+                                  #     - 1.0 = Right edge
+                                  # The player will turn back once reaching these bounds.
+  turn_point_thres: 10            # 馃攣 Number of consecutive frames required to confirm a turn point
+  patrol_attack_interval: 2.5     # 馃晵 Time in seconds between each attack while patrolling
+
+route_recoder:
+  # 馃帴 Route Recorder
+  # The route recorder is a standalone tool that helps generate `map.png` and `route*.png`.
+  # It records the player's movement and actions, then saves them as a route map image.
+  blob_cooldown: 0.7        # 鈴憋笍 Cooldown in seconds between recording actions like 'jump' or 'teleport'
+                            #     These actions are marked as a "blob" on the route map
+  map_padding: 30           # 馃枻 Padding (in pixels) added as margin around the edge of the map
+
+game_window:
+  # 馃獰 Game Window
+  # Basic information about the game window setup
+  title: "冒险岛怀旧服"         # 馃幃 Game window title (used to detect the correct window)
+  outer_size: [759, 1296]       # 馃枼锔?Optional outer size [height, width]
+  resize_on_start: False        # 馃搹 Preserve the user's current game-window size
+  size: [693, 1282]            # 馃搻 Game window size [height, width] in pixels, (Excluded title bar size)
+  ratio_tolerance: 0.08        # 馃搻 Game window 16:9 tolerance
+  title_bar_height: 59         # 馃搻 Title Bar Height (Note it's before window resize)
+
+email:
+  # 馃摡 Email
+  # Send email to notify user
+  # This feature is currently work in prograss
+  enable: False                                   # 鉁?  sender_email: "maplestoryautolevelup@gmail.com" # Your don't have to change this
+  sender_password: "lvxfdhthvvrcuojj"             # Your don't have to change this
+  receiver_email: "luckyyu910645@gmailcom"        # 馃摡 Put your email here
+
+system:
+  # 鈿欙笍 System Settings
+  # Controls performance and behavior of core system threads.
+  fps_limit_main: 30                # 馃殽 Main loop FPS 鈥?controls recognition and monitor refresh
+  fps_limit_keyboard_controller: 30 # 馃殽 Keyboard controller thread FPS
+  fps_limit_window_capturor: 30     # 馃殽 Window capture thread FPS
+  fps_limit_route_visualization: 4
+  fps_limit_debug_ui: 8
+  debug_ui_scale: 0.85  # Monitor preview scale; higher = sharper (trade FPS)
+  fps_limit_route_recorder: 10      # 馃殽 Route recorder FPS
+  fps_limit_auto_dice_roller: 1     # 馃殽 Auto rice roller FPS
+  key_debounce_interval: 1          # 鈴憋笍 Cooldown (in seconds) between function key presses (e.g., F1, F2...)
+  server: "TW"                      # 鈿欙笍 Options: "TW" "NA"
+  language: "cn"                    # 鈿欙笍 Options: "eng" "cn"
+
+
+shutdown_monitor:
+  # Timed / lost-character auto-shutdown (UI tab "定时关机")
+  # timed: at local HH:MM run `shutdown /s /t <shutdown_delay_sec>`
+  # lost: if player missing continuously for lost_seconds while bot runs
+  # Unchecking runs `shutdown /a` to abort a pending countdown
+  timed_enable: false
+  timed_at: "03:00"
+  lost_enable: false
+  lost_seconds: 60
+  shutdown_delay_sec: 60
+
+profiler:
+  # 鈿欙笍 Profiler
+  # For FPS/performance debugging
+  # When the FPS is lower than 5, please use profiler to find which code block is costing more time 
+  enable: False       # 鉁?To print the profiler result or not
+  print_frequency: 30 # Print profiler result for every 30 frames

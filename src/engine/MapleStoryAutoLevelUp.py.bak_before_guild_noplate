@@ -1,0 +1,4035 @@
+'''
+Execute this script:
+python mapleStoryAutoLevelUp.py --map cloud_balcony --monster brown_windup_bear,pink_windup_bear
+'''
+# Standard import
+import time
+import random
+import argparse
+import glob
+import sys
+import logging
+import os
+import datetime
+import threading
+import subprocess
+
+# Library import
+import numpy as np
+import cv2
+import yaml
+
+# Local import
+from src.utils.global_var import WINDOW_WORKING_SIZE
+from src.utils.logger import logger
+from src.utils.common import (find_pattern_sqdiff, draw_rectangle, screenshot, nms,
+    load_image, get_mask, get_minimap_loc_size, get_player_location_on_minimap,
+    is_mac, override_cfg, load_yaml, get_all_other_player_locations_on_minimap,
+    click_in_game_window, mask_route_colors, to_opencv_hsv, debug_minimap_colors,
+    activate_game_window, is_img_16_to_9, normalize_pixel_coordinate, resize_window,
+    match_minimap_on_map,
+)
+from src.utils.paths import MINIMAPS, MONSTER, NAMETAG, MISC
+from src.utils.monster_templates import (
+    load_monster_template,
+    select_monster_template_files,
+)
+from src.utils.monster_tracker import MonsterTracker
+from src.utils.hp_bar import (
+    detect_monster_hp_bars,
+    hp_bar_in_attack_box,
+    merge_hp_bar_detections,
+)
+from src.utils.nametag import (
+    crop_nametag_guild_band,
+    derive_guild_offset,
+    find_best_nametag_match,
+    find_nametag_match_candidates,
+    load_nametag_layers,
+    nametag_match_mask,
+    normalize_nametag_layers,
+    pick_nametag_candidate,
+    plate_support,
+    prepare_nametag_template,
+)
+from src.utils.route_visualization import render_route_visualization
+from src.input.KeyBoardController import KeyBoardController, press_key
+from src.input.KeyBoardListener import KeyBoardListener
+if is_mac():
+    from src.input.GameWindowCapturorForMac import GameWindowCapturor
+else:
+    from src.input.GameWindowCapturor import GameWindowCapturor
+from src.engine.HealthMonitor import HealthMonitor
+from src.engine.Profiler import Profiler
+from src.engine.FiniteStateMachine import FiniteStateMachine
+from src.states.hunting import HuntingState
+from src.states.auxiliary import AuxiliaryState
+from src.states.patrol import PatrolState
+from src.states.smart_patrol import SmartPatrolState
+from src.utils.patrol import merge_patrol_into_smart_patrol
+from src.utils.ropes import load_ropes, ropes_path
+
+
+def load_optional_image(path, mode=cv2.IMREAD_COLOR):
+    """Load a feature-specific image without aborting the whole bot startup."""
+    if not os.path.exists(path):
+        logger.warning(f"Optional image not found; related feature is unavailable: {path}")
+        return None
+    try:
+        return load_image(path, mode)
+    except (FileNotFoundError, ValueError):
+        logger.warning(f"Optional image is unusable; related feature is unavailable: {path}")
+        return None
+
+
+class MapleStoryAutoBot:
+    '''
+    MapleStoryAutoBot
+    '''
+    def __init__(self, args):
+        '''
+        Init MapleStoryAutoBot
+        '''
+        self.args = args # User args
+        self.cfg = None # Configuration
+        self.idx_routes = 0 # Index of route map
+        self.monsters_info = {} # monster information
+        self.monsters = [] # monster detected in current frame (live only)
+        self.soft_monsters = [] # ghost tracks within TTL (not for AoE count)
+        self.decision_monsters = [] # live U soft for engage / nearest target
+        self.monster_tracker = MonsterTracker()
+        self.fps = 0 # Frame per second
+        self.red_dot_center_prev = None # previous other player location in minimap
+        self.video_writer = None # For video recording feature
+        self.color_code = {} # For color code instruction
+        self.color_code_up_down = {} # Color code only contain 'up' and 'down'
+        self.thread_auto_bot = None # thread for running autobot
+        self.cmd_move_x = "none" # "left" "right"
+        self.cmd_move_y = "none" # "up" "down"
+        self.rope_doc = {}
+        self.rope_edges = []
+        self.startup_warnings = []
+        self.cmd_action = "none" # "jump" "attack" ....
+        # Signals (for UI)
+        self.image_debug_signal = None
+        self.route_map_viz_signal = None
+        # Flags
+        self.is_first_frame = True # first frame flag
+        self.is_terminated = False # Close all object and thread if True
+        self.is_on_ladder = False # Character is on ladder or not
+        self.is_show_debug_window = not args.disable_viz #
+        self.is_need_show_debug_window = not args.disable_viz #
+        self.is_disable_control = args.disable_control
+        self.is_ui = args.is_ui # Whether is using UI framework to invoke engine
+        self.is_frame_done = False #
+        # Coordinate (top-left coordinate)
+        self.loc_nametag = (0, 0) # nametag location on game screen
+        self.nametag_match_valid = False
+        self.nametag_miss_count = 0
+        self.nametag_last_size = (0, 0)
+        self.nametag_last_score = 1.0
+        # Guild-row fallback (local-only when name is pet-occluded)
+        self.img_nametag_guild = None
+        self.img_nametag_guild_gray = None
+        self.nametag_guild_dy = 0
+        self.nametag_guild_offset = None
+        self.nametag_last_source = "name"
+        self.loc_party_red_bar = (0, 0) # party red bar location on game screen
+        self.loc_minimap = (0, 0) # minimap location on game screen
+        self.loc_player = (0, 0) # player location on game screen
+        self.loc_player_minimap = (0, 0) # player location on minimap
+        self.loc_minimap_global = (0, 0) # minimap location on global map
+        self.loc_player_global = (0, 0) # player location on global map
+        self.loc_watch_dog = (0, 0) # watch dog location on global map
+        # Images
+        self.frame = None # raw image
+        self.img_frame = None # game window frame
+        self.img_frame_gray = None # game window frame graysale
+        self.img_frame_debug = None # game window frame for visualization
+        self.img_route = None # route map
+        self.img_route_debug = None # route map for visualization
+        self.img_route_viz = None # throttled, display-only route overview
+        self.monsters_contour_patterns = {}  # pre-blurred contour templates
+        self.t_last_debug_ui = 0.0
+        self.debug_ui_updated = False
+        self._debug_canvas_this_frame = False
+        self._monster_detect_tick = 0
+        self._nametag_scan_tick = 0
+        self.img_minimap = np.zeros((10, 10, 3), dtype=np.uint8) # minimap on game screen
+        self.last_minimap_geometry = None
+        self.is_player_minimap_detected = False
+        # Timers
+        self.t_last_frame = time.time() # Last frame timer, for fps calculation
+        self.t_watch_dog = time.time() # Last movement timer
+        self.t_last_teleport = time.time() # Last teleport timer
+        self.t_last_attack = time.time() # Last attack timer for cooldown
+        self.t_last_aoe_attack = time.time()
+        self.t_next_aoe_attack = 0.0
+        self.hybrid_aoe_monster_count = 0
+        self.combat_turn_ready_at = 0.0
+        self.combat_turn_pending_direction = None
+        self.combat_turn_requested_at = 0.0
+        # Engage-hold: keep finishing a mob instead of walking away after 1 hit
+        self.engage_until = 0.0
+        self.engage_side = None
+        self.engage_miss_since = 0.0
+        # Hit-react: brief retreat/jump on sharp HP drop (vision-lag aware)
+        self.prev_hp_percent = None
+        self.hit_react_until = 0.0
+        self.hit_react_dir = None  # "left" | "right"
+        self.hit_react_need_jump = False
+        self.t_last_hit_react = 0.0
+        self.t_last_monster_seen = 0.0
+        self.t_last_minimap_update = time.time()
+        self.t_last_minimap_detection_warning = 0.0
+        self.t_last_player_minimap_warning = 0.0
+        # Shutdown monitor (lost character)
+        self._shutdown_lost_since = None
+        self._shutdown_lost_fired = False
+        self._shutdown_pending = False
+        # Stuck / off-route recovery tracking
+        self.recovery_since = None
+        self.t_minimap_lost_since = None
+        self.t_last_stuck_log = 0.0
+        self.t_last_recovery_random = 0.0
+        self.t_last_recovery_log = 0.0
+        self.t_to_change_channel = time.time()
+        self.t_last_route_viz = 0.0
+        self.route_viz_updated = False
+        self.t_last_debug_ui = 0.0
+        self.debug_ui_updated = False
+        # Images
+        self.img_map = None
+        self.img_routes = []
+        self.img_nametag = None
+        self.img_nametag_gray = None
+        self.img_create_party_enable = None
+        self.img_create_party_disable = None
+        self.img_login_button = None
+
+        # Database
+        self.data = load_yaml("config/config_data.yaml")
+        resource_override_path = "config/config_resource_overrides.yaml"
+        if os.path.exists(resource_override_path):
+            self.data = override_cfg(self.data, load_yaml(resource_override_path))
+        # Threads & Objects
+        self.kb = None # Keyboard controller
+        self.capture = None # Game window capturor
+        self.health_monitor = None # Health monitor
+        self.profiler = None # Profiler, for performance issue debugging
+
+        # Finite State Machine
+        self.fsm = FiniteStateMachine()
+        self.fsm.add_state(HuntingState      ("hunting"      , self))
+        self.fsm.add_state(AuxiliaryState    ("aux"          , self))
+        self.fsm.add_state(PatrolState       ("patrol"       , self))
+        self.fsm.add_state(SmartPatrolState  ("smart_patrol" , self))
+        self.fsm.set_init_state("hunting")
+
+    def update_signals(self, image_debug_signal, route_map_viz_signal):
+        '''
+        Update signal from UI framework.
+        For debug window viz
+        '''
+        self.image_debug_signal = image_debug_signal
+        self.route_map_viz_signal = route_map_viz_signal
+
+    def load_config(self, cfg):
+        '''
+        load_config
+        '''
+        # Maps and monster associations can be edited from the UI after the
+        # controller is constructed, so refresh the resource catalog on start.
+        self.data = load_yaml("config/config_data.yaml")
+        resource_override_path = "config/config_resource_overrides.yaml"
+        if os.path.exists(resource_override_path):
+            self.data = override_cfg(self.data, load_yaml(resource_override_path))
+        self.monsters_info.clear()
+        self.monsters_contour_patterns = {}
+
+        # Parse color code in config
+        self.color_code = {
+            tuple(map(int, k.split(','))): v
+            for k, v in cfg["route"]["color_code"].items()
+        }
+        self.color_code_up_down = {
+            tuple(map(int, k.split(','))): v
+            for k, v in cfg["route"]["color_code_up_down"].items()
+        }
+
+        if cfg["bot"]["mode"] in ("normal", "smart_patrol"):
+            map_name = cfg['bot']['map']
+            # Check if the map is supported in config_data.yaml
+            if map_name not in self.data["map_mobs_mapping"]:
+                text = f"Invalid map name: {map_name}. "\
+                        "Not supported in config/config_data.yaml."
+                logger.error(text)
+                return -1
+                # raise RuntimeError(text)
+
+            if cfg["bot"]["mode"] == "normal":
+                # Load map.png from assets/minimaps/
+                self.img_map = load_image(f"{MINIMAPS}/{map_name}/map.png",
+                                          cv2.IMREAD_COLOR)
+                # Load route*.png from assets/minimaps/
+                route_files = sorted(glob.glob(f"{MINIMAPS}/{map_name}/route*.png"))
+                route_files = [p for p in route_files if not p.endswith("route_rest.png")]
+                if not route_files:
+                    logger.error(f"No route images found in {MINIMAPS}/{map_name}/")
+                    return -1
+                self.img_routes = []
+                for route_file in route_files:
+                    img = cv2.cvtColor(load_image(route_file), cv2.COLOR_BGR2RGB)
+                    # Remove pixel in map that is color code
+                    img = mask_route_colors(self.img_map, img, cfg["route"]["color_code"])
+                    img = mask_route_colors(self.img_map, img, cfg["route"]["color_code_up_down"])
+                    self.img_routes.append(img)
+            else:
+                # smart_patrol: minimap scan + engage; route PNGs not required
+                self.img_map = None
+                self.img_routes = []
+                logger.info('[load_config] smart_patrol: map=%s, skipping route PNGs (Scan uses live minimap)' % (map_name,))
+                # P2: load recorded rope edges for layer Return
+                self.rope_doc = load_ropes(map_name)
+                self.rope_edges = list(self.rope_doc.get("edges") or [])
+                logger.info('[load_config] smart_patrol ropes: %s edge(s) from %s' % (len(self.rope_edges), ropes_path(map_name)))
+                # Per-map bounds from assets/minimaps/{map}/patrol.yaml (if present)
+                cfg["smart_patrol"] = merge_patrol_into_smart_patrol(
+                    cfg.get("smart_patrol") or {}, map_name
+                )
+                self.cfg = cfg
+                if cfg["smart_patrol"].get("preferred_y") is not None:
+                    self.rope_doc["preferred_y"] = cfg["smart_patrol"]["preferred_y"]
+                if cfg["smart_patrol"].get("preferred_y_tol") is not None:
+                    self.rope_doc["preferred_y_tol"] = cfg["smart_patrol"]["preferred_y_tol"]
+                logger.info(
+                    '[load_config] smart_patrol bounds: range=%s preferred_y=%s rope_enable=%s'
+                    % (
+                        cfg["smart_patrol"].get("range"),
+                        cfg["smart_patrol"].get("preferred_y"),
+                        cfg["smart_patrol"].get("rope_enable"),
+                    )
+                )
+                # Soft note only (no QMessageBox / status nag): empty ropes disable Return.
+                self.startup_warnings = []
+                rope_enable = cfg["smart_patrol"].get("rope_enable", False)
+                if isinstance(rope_enable, str):
+                    rope_enable = rope_enable.strip().lower() in ("1", "true", "yes", "on")
+                if rope_enable and len(self.rope_edges) == 0:
+                    logger.info(
+                        "[load_config] smart_patrol: rope_enable=true but ropes.yaml edges=[] "
+                        "(map=%s) — Return disabled until ropes are recorded. No modal warning."
+                        % (map_name,)
+                    )
+
+
+            # Load monsters images from assets/monster/<monster_name>
+            alpha_threshold = cfg["monster_detect"].get("alpha_threshold", 32)
+            template_scales = cfg["monster_detect"].get("template_scales", (1.0,))
+            # Prefer living poses; die/hit frames rarely help Hybrid/AoE and burn FPS.
+            name_prefixes = cfg["monster_detect"].get(
+                "template_name_prefixes", ["stand"]
+            )
+            if isinstance(name_prefixes, str):
+                name_prefixes = [name_prefixes]
+            name_prefixes = [str(p).lower() for p in (name_prefixes or []) if str(p).strip()]
+            max_files = int(cfg["monster_detect"].get("template_max_files_per_monster", 6) or 0)
+            per_prefix = cfg["monster_detect"].get("template_max_files_per_prefix")
+            for monster_name in self.data["map_mobs_mapping"].get(map_name, []):
+                imgs = []
+                monster_files = sorted(glob.glob(f"{MONSTER}/{monster_name}/*"))
+                monster_files = [
+                    file for file in monster_files
+                    if os.path.splitext(file)[1].lower() in (".png", ".jpg", ".jpeg", ".bmp")
+                ]
+                monster_files = select_monster_template_files(
+                    monster_files,
+                    prefixes=name_prefixes,
+                    max_files=max_files,
+                    per_prefix=per_prefix,
+                )
+                for file in monster_files:
+                    try:
+                        img_base, mask_base = load_monster_template(
+                            file,
+                            alpha_threshold=alpha_threshold,
+                        )
+                    except (FileNotFoundError, ValueError) as error:
+                        logger.warning(str(error))
+                        continue
+
+                    for scale in template_scales:
+                        scale = float(scale)
+                        if scale <= 0:
+                            logger.warning(f"Ignore invalid monster template scale: {scale}")
+                            continue
+                        if scale == 1.0:
+                            img = img_base
+                            mask = mask_base
+                        else:
+                            img = cv2.resize(
+                                img_base,
+                                None,
+                                fx=scale,
+                                fy=scale,
+                                interpolation=cv2.INTER_NEAREST,
+                            )
+                            mask = cv2.resize(
+                                mask_base,
+                                (img.shape[1], img.shape[0]),
+                                interpolation=cv2.INTER_NEAREST,
+                            )
+
+                        imgs.append((img, mask))
+                        imgs.append((cv2.flip(img, 1), cv2.flip(mask, 1)))
+                if imgs:
+                    self.monsters_info[monster_name] = imgs
+                    logger.info(
+                        f"[load_config] {MONSTER}/{monster_name}: "
+                        f"{len(monster_files)} files -> {len(imgs)} templates "
+                        f"(incl. flips/scales)"
+                    )
+                else:
+                    logger.warning(f"No usable images found in {MONSTER}/{monster_name}/")
+            # Pre-blur contour patterns once so hunting does not redo it every frame.
+            blur = int(cfg["monster_detect"].get("contour_blur", 5) or 5)
+            if blur < 1:
+                blur = 1
+            if blur % 2 == 0:
+                blur += 1
+            self.monsters_contour_patterns = {}
+            for monster_name, pairs in self.monsters_info.items():
+                patterns = []
+                for img, mask in pairs:
+                    black_pixels = np.all(img == [0, 0, 0], axis=2)
+                    visible_pixels = mask > 0
+                    mask_pattern = (black_pixels & visible_pixels).astype(np.uint8) * 255
+                    patterns.append(cv2.GaussianBlur(mask_pattern, (blur, blur), 0))
+                self.monsters_contour_patterns[monster_name] = patterns
+            logger.info(f"Loaded monsters: {list(self.monsters_info.keys())}")
+
+        # Load player's name tag (dual: track=1-layer, verify=full layers)
+        self.img_nametag = None
+        self.img_nametag_gray = None
+        self.img_nametag_verify = None
+        self.img_nametag_verify_gray = None
+        self.img_nametag_guild = None
+        self.img_nametag_guild_gray = None
+        self.nametag_guild_dy = 0
+        self.nametag_guild_offset = None
+        self.nametag_dual_enabled = False
+        self.nametag_match_valid = False
+        self.nametag_miss_count = 0
+        self.nametag_last_source = "name"
+        self.nametag_last_size = (0, 0)
+        self.nametag_last_score = 1.0
+        self.nametag_last_verify_score = 1.0
+        # P0: hold last-good player pose across combat occlusion gaps
+        self.nametag_hold_remaining = 0
+        self.nametag_hold_player = None
+        self.nametag_hold_loc = None
+        self.nametag_hold_size = (0, 0)
+        self.nametag_hold_score = 1.0
+        if cfg["nametag"]["enable"]:
+            nametag_path = f"{NAMETAG}/{cfg['nametag']['name']}.png"
+            if os.path.exists(nametag_path):
+                loaded_nametag = load_image(nametag_path)
+                nametag_cfg = cfg.get("nametag") or {}
+                configured_layers = normalize_nametag_layers(
+                    nametag_cfg.get(
+                        "layers",
+                        load_nametag_layers(
+                            nametag_cfg.get("name"),
+                            directory=NAMETAG,
+                            default=3,
+                        ),
+                    ),
+                    default=3,
+                )
+                dual_raw = nametag_cfg.get("dual_template", True)
+                if isinstance(dual_raw, str):
+                    dual_raw = dual_raw.strip().lower() in ("1", "true", "yes", "on")
+                use_dual = bool(dual_raw) and configured_layers >= 2
+
+                stack = prepare_nametag_template(
+                    loaded_nametag, layers=configured_layers
+                )
+                if use_dual:
+                    track = prepare_nametag_template(loaded_nametag, layers=1)
+                    verify = stack
+                    self.img_nametag = track
+                    self.img_nametag_gray = cv2.cvtColor(track, cv2.COLOR_BGR2GRAY)
+                    self.img_nametag_verify = verify
+                    self.img_nametag_verify_gray = cv2.cvtColor(
+                        verify, cv2.COLOR_BGR2GRAY
+                    )
+                    self.nametag_dual_enabled = True
+                    logger.info(
+                        "[load_config] Dual nametag: track=%sx%s (1-layer) "
+                        "verify=%sx%s (%s-layer)"
+                        % (
+                            track.shape[1],
+                            track.shape[0],
+                            verify.shape[1],
+                            verify.shape[0],
+                            configured_layers,
+                        )
+                    )
+                else:
+                    self.img_nametag = stack
+                    self.img_nametag_gray = cv2.cvtColor(stack, cv2.COLOR_BGR2GRAY)
+                    self.img_nametag_verify = None
+                    self.img_nametag_verify_gray = None
+                    self.nametag_dual_enabled = False
+                    if stack.shape[:2] != loaded_nametag.shape[:2]:
+                        logger.info(
+                            "[load_config] Trimmed nametag template "
+                            f"{loaded_nametag.shape[1]}x{loaded_nametag.shape[0]} -> "
+                            f"{stack.shape[1]}x{stack.shape[0]}"
+                        )
+                # Guild-row band for pet-occlusion fallback (local search only).
+                self._load_nametag_guild_band(stack, nametag_cfg)
+            else:
+                self.img_nametag = None
+                self.img_nametag_gray = None
+                self.img_nametag_verify = None
+                self.img_nametag_verify_gray = None
+                self.nametag_dual_enabled = False
+                self.img_nametag_guild = None
+                self.img_nametag_guild_gray = None
+                self.nametag_guild_dy = 0
+                self.nametag_guild_offset = None
+                logger.warning(f"Nametag image not found: {nametag_path}; fallback detection will be used")
+
+        # Load feature-specific images. Missing optional assets must not prevent
+        # normal route execution from starting.
+        lang = cfg["system"]["language"]
+        if cfg["party_red_bar"].get("enable", False):
+            self.img_create_party_enable = load_optional_image(
+                f"{MISC}/party_button_create_enable_{lang}.png"
+            )
+            self.img_create_party_disable = load_optional_image(
+                f"{MISC}/party_button_create_disable_{lang}.png"
+            )
+        else:
+            self.img_create_party_enable = None
+            self.img_create_party_disable = None
+        self.img_login_button = load_optional_image(f"{MISC}/login_button_{lang}.png")
+
+        # Normalized pixel coordinate configuration
+        cfg['ui_coords']['login_button_top_left'] = normalize_pixel_coordinate(
+            cfg['ui_coords']['login_button_top_left'], cfg['game_window']['size'])
+        cfg['ui_coords']['login_button_bottom_right'] = normalize_pixel_coordinate(
+            cfg['ui_coords']['login_button_bottom_right'], cfg['game_window']['size'])
+
+        # Print mode on log
+        logger.info(f"[load_config] Config AutoBot as {cfg['bot']['mode']} mode")
+
+        # Update cfg
+        self.cfg = cfg
+
+        return 0 # load successfully
+
+    def start(self):
+        '''
+        Start all threads
+        '''
+        self.is_terminated = False
+
+        # Establish a valid video feed before starting any thread that can press
+        # keys. This prevents buffs/actions from running against a blind bot.
+        if self.args.test_image == '':
+            self.capture = GameWindowCapturor(self.cfg)
+        else:
+            self.capture = GameWindowCapturor(self.cfg, self.args.test_image)
+
+        first_frame = self._wait_for_valid_game_frame(timeout=4.0)
+        if first_frame is None and not is_mac() and self.args.test_image == '':
+            logger.warning(
+                "[MapleStoryAutoBot] Windows capture produced no valid frame; "
+                "falling back to MSS"
+            )
+            self.capture.stop()
+            self.capture = GameWindowCapturor(self.cfg, backend="mss")
+            first_frame = self._wait_for_valid_game_frame(timeout=4.0)
+
+        if first_frame is None:
+            if self.capture is not None:
+                self.capture.stop()
+            raise RuntimeError(
+                "无法获取有效游戏画面，控制线程未启动。请确认游戏窗口可见、"
+                "处于窗口模式且分辨率正确。"
+            )
+
+        self.img_frame = first_frame
+        logger.info(
+            f"[MapleStoryAutoBot] Capture ready via "
+            f"{getattr(self.capture, 'backend', 'default')}: "
+            f"source {self.frame.shape[:2]} -> normalized {first_frame.shape[:2]}"
+        )
+
+        # Start keyboard controller only after capture readiness is confirmed.
+        self.kb = KeyBoardController(self.cfg)
+        if self.is_disable_control:
+            self.kb.disable() # Disable keyboard controller for debugging
+
+        # Start health monitoring thread
+        self.health_monitor = HealthMonitor(self.cfg, self.kb)
+        if self.cfg["health_monitor"]["enable"] and \
+            not self.is_disable_control:
+            self.health_monitor.start()
+
+        # Init profiler
+        self.profiler = Profiler(self.cfg)
+
+        # Reset all timers
+        self.t_last_frame = time.time()
+        self.t_watch_dog = time.time()
+        self.t_last_teleport = time.time()
+        self.t_last_attack = time.time()
+        self.t_last_aoe_attack = time.time()
+        self.t_next_aoe_attack = 0.0
+        self.recovery_since = None
+        self.recovery_clear_since = None
+        self.t_minimap_lost_since = None
+        self.t_last_stuck_log = 0.0
+        self.t_last_recovery_random = 0.0
+        self.t_last_recovery_log = 0.0
+        self.hybrid_aoe_monster_count = 0
+        self.combat_turn_ready_at = 0.0
+        self.combat_turn_pending_direction = None
+        self.combat_turn_requested_at = 0.0
+        self.t_last_minimap_update = time.time()
+        self.t_to_change_channel = time.time()
+        self.t_last_route_viz = 0.0
+        self.route_viz_updated = False
+        self.t_last_debug_ui = 0.0
+        self.debug_ui_updated = False
+        self._debug_canvas_this_frame = False
+        self._monster_detect_tick = 0
+        self._nametag_scan_tick = 0
+        self._nametag_run_this_frame = None
+        self.img_route_viz = None
+
+        # Set init state
+        if self.args.init_state != "":
+            self.fsm.set_init_state(self.args.init_state) # For debugging
+        elif self.cfg["bot"]["mode"] == "aux":
+            self.fsm.set_init_state("aux")
+        elif self.cfg["bot"]["mode"] == "patrol":
+            self.fsm.set_init_state("patrol")
+        elif self.cfg["bot"]["mode"] == "smart_patrol":
+            self.fsm.set_init_state("smart_patrol")
+        else:
+            self.fsm.set_init_state("hunting")
+
+        # Start Auto Bot main thread
+        self.thread_auto_bot = threading.Thread(target=self.loop)
+        self.thread_auto_bot.start()
+        self.is_first_frame = True
+
+        logger.info("[MapleStoryAutoBot] Started")
+
+    def _wait_for_valid_game_frame(self, timeout=4.0):
+        """Return the first valid processed frame, or None before timeout."""
+        deadline = time.time() + timeout
+        first_wait = True
+        while time.time() < deadline:
+            try:
+                if first_wait and hasattr(self.capture, "wait_for_frame"):
+                    self.capture.wait_for_frame(min(1.0, timeout))
+                    first_wait = False
+                img_frame = self.get_img_frame(log_failure=False)
+            except Exception as error:
+                logger.warning(f"[MapleStoryAutoBot] Capture unavailable: {error}")
+                return None
+            if img_frame is not None:
+                return img_frame
+            time.sleep(0.05)
+        return None
+
+    def pause(self):
+        '''
+        Terminate thread except main thread
+        '''
+        self.terminate_threads()
+
+    def enable_viz(self):
+        '''
+        Enable AutoBot to generate debug image
+        '''
+        self.is_need_show_debug_window = True
+        logger.debug("[enable_viz] is_show_debug_window = True")
+
+    def disable_viz(self):
+        '''
+        Disable AutoBot to generate debug image
+        '''
+        self.is_need_show_debug_window = False
+        logger.debug("[disable_viz] is_show_debug_window = False")
+
+    def start_record(self):
+        '''
+        Start record
+        '''
+        # Prepare video writer if need to record
+        if not self.is_show_debug_window:
+            self.enable_viz()
+
+        # Make sure video/ exist
+        os.makedirs("video", exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        path = os.path.join("video", f"{timestamp}.mp4")
+
+        # Get video writer
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # mp4 codec
+        self.video_writer = cv2.VideoWriter(path, fourcc, 10, WINDOW_WORKING_SIZE)
+
+        logger.info(f"[start_record] Record video to {path}")
+
+    def stop_record(self):
+        '''
+        Stop Record
+        '''
+        self.video_writer = None
+        logger.info("[stop_record] Stop recording")
+
+
+    def _nametag_reacquire_box_from_minimap(self, img_w, img_h, search_left, search_top):
+        """Bias nametag reacquire ROI using minimap player position.
+
+        Default edge margin is 10% of minimap width/height (configurable via
+        nametag.minimap_edge_frac). If the player is more than that margin
+        inward from all edges, treat as center and search the window center.
+        If within 10% of any edge, bias the search ROI toward that screen side.
+        """
+        nametag_cfg = self.cfg.get("nametag", {}) or {}
+        edge_frac = float(nametag_cfg.get("minimap_edge_frac", 0.10))
+        center_frac = float(nametag_cfg.get("reacquire_center_frac", 0.55))
+        side_frac = float(nametag_cfg.get("reacquire_side_frac", 0.62))
+
+        play_w = max(1, img_w - search_left)
+        play_h = max(1, img_h - search_top)
+
+        loc = getattr(self, "loc_player_minimap", None)
+        mini = getattr(self, "img_minimap", None)
+        use_center = True
+        bias_x = 0.5
+        bias_y = 0.45  # nametag sits above body
+        if (
+            loc is not None
+            and mini is not None
+            and getattr(mini, "size", 0) != 0
+            and len(getattr(mini, "shape", ())) >= 2
+        ):
+            mh, mw = mini.shape[:2]
+            if mw > 4 and mh > 4:
+                mx, my = float(loc[0]), float(loc[1])
+                nx = max(0.0, min(1.0, mx / float(mw)))
+                ny = max(0.0, min(1.0, my / float(mh)))
+                near_left = nx <= edge_frac
+                near_right = nx >= 1.0 - edge_frac
+                near_top = ny <= edge_frac
+                near_bottom = ny >= 1.0 - edge_frac
+                if near_left or near_right or near_top or near_bottom:
+                    use_center = False
+                    bias_x = nx
+                    bias_y = ny
+
+        if use_center:
+            box_w = max(80, int(play_w * center_frac))
+            box_h = max(80, int(play_h * center_frac))
+            cx = search_left + play_w // 2
+            cy = search_top + int(play_h * 0.45)
+        else:
+            box_w = max(80, int(play_w * side_frac))
+            box_h = max(80, int(play_h * side_frac))
+            cx = search_left + int(bias_x * play_w)
+            cy = search_top + int(bias_y * play_h)
+
+        x0 = int(cx - box_w // 2)
+        y0 = int(cy - box_h // 2)
+        x1 = x0 + box_w
+        y1 = y0 + box_h
+        x0 = max(search_left, min(x0, img_w - 1))
+        y0 = max(search_top, min(y0, img_h - 1))
+        x1 = max(x0 + 1, min(x1, img_w))
+        y1 = max(y0 + 1, min(y1, img_h))
+        return (x0, y0, x1, y1)
+
+
+    def _nametag_verify_candidate(self, img_roi, loc, scale, nametag_cfg):
+        """Score 3-layer (verify) template at a track hit. Returns (ok, score)."""
+        if not getattr(self, "nametag_dual_enabled", False):
+            return True, None
+        verify = getattr(self, "img_nametag_verify", None)
+        if verify is None:
+            return True, None
+        mask = nametag_match_mask(verify)
+        sx, sy = scale if isinstance(scale, (tuple, list)) else (1.0, 1.0)
+        vh, vw = verify.shape[:2]
+        scaled_h = max(1, int(round(vh * float(sy))))
+        scaled_w = max(1, int(round(vw * float(sx))))
+        pad = 12
+        box = (
+            max(0, int(loc[0]) - pad),
+            max(0, int(loc[1]) - pad),
+            min(img_roi.shape[1], int(loc[0]) + scaled_w + pad),
+            min(img_roi.shape[0], int(loc[1]) + scaled_h + pad),
+        )
+        hit = find_best_nametag_match(
+            img_roi,
+            verify,
+            mask,
+            ((sx, sy), (1.0, 1.0), (0.95, 0.95)),
+            box,
+            require_plate=True,
+        )
+        if hit is None:
+            # No verify hit → fail; caller may P0-hold last-good pose.
+            return False, 1.0
+        _vloc, vscore, _vsize, _vscale = hit
+        verify_thres = float(nametag_cfg.get("verify_diff_thres", 0.28))
+        occluded_thres = float(nametag_cfg.get("occluded_diff_thres", 0.40))
+        if vscore < verify_thres:
+            return True, float(vscore)
+        # Allow weak verify if the crop still looks like a plate stack.
+        y0 = max(0, int(loc[1]))
+        x0 = max(0, int(loc[0]))
+        crop = img_roi[y0:y0 + scaled_h, x0:x0 + scaled_w]
+        if crop.size and plate_support(crop) >= float(
+            nametag_cfg.get("occluded_plate_support", 0.22)
+        ) and vscore < occluded_thres:
+            return True, float(vscore)
+        return False, float(vscore)
+
+
+    def _load_nametag_guild_band(self, stack_image, nametag_cfg):
+        """Prepare guild-only template + offset from the multi-layer stack."""
+        self.img_nametag_guild = None
+        self.img_nametag_guild_gray = None
+        self.nametag_guild_dy = 0
+        self.nametag_guild_offset = None
+        enable_raw = nametag_cfg.get("guild_fallback_enable", True)
+        if isinstance(enable_raw, str):
+            enable_raw = enable_raw.strip().lower() in ("1", "true", "yes", "on")
+        if not enable_raw:
+            logger.info("[load_config] Guild nametag fallback disabled by config")
+            return
+        guild_img, info = crop_nametag_guild_band(stack_image)
+        if guild_img is None or info is None:
+            logger.info(
+                "[load_config] No guild band on nametag template; "
+                "guild fallback inactive"
+            )
+            return
+        self.img_nametag_guild = guild_img
+        self.img_nametag_guild_gray = cv2.cvtColor(guild_img, cv2.COLOR_BGR2GRAY)
+        self.nametag_guild_dy = int(info.get("guild_dy", 0) or 0)
+        name_offset = nametag_cfg.get("offset", [0, 30])
+        self.nametag_guild_offset = derive_guild_offset(
+            name_offset,
+            self.nametag_guild_dy,
+            configured=nametag_cfg.get("guild_offset"),
+        )
+        logger.info(
+            "[load_config] Guild fallback band=%sx%s dy=%s offset=%s"
+            % (
+                guild_img.shape[1],
+                guild_img.shape[0],
+                self.nametag_guild_dy,
+                self.nametag_guild_offset,
+            )
+        )
+
+    def _nametag_pose_from_guild_match(self, loc_guild, matched_size, matched_scale):
+        """Guild-row top-left → player center via guild_offset (Y larger than name)."""
+        offset = self.nametag_guild_offset
+        if not offset:
+            name_off = self.cfg.get("nametag", {}).get("offset", [0, 30])
+            offset = derive_guild_offset(
+                name_off, int(getattr(self, "nametag_guild_dy", 0) or 0)
+            )
+        # Mirror name pose: X = match center (ignore offset[0]); Y = top - offset_y.
+        offset_y = offset[1]
+        scale_x, scale_y = matched_scale
+        return (
+            int(loc_guild[0] + matched_size[1] // 2),
+            int(loc_guild[1] - round(float(offset_y) * float(scale_y))),
+        )
+
+    def _nametag_name_loc_from_guild(self, loc_guild, matched_scale):
+        """Map guild-row top-left back to equivalent name-row / track top-left."""
+        scale_y = float(matched_scale[1]) if matched_scale is not None else 1.0
+        dy = int(round(float(getattr(self, "nametag_guild_dy", 0) or 0) * scale_y))
+        return (int(loc_guild[0]), int(loc_guild[1]) - dy)
+
+    def _try_guild_nametag_fallback(
+        self,
+        img_roi,
+        nametag_cfg,
+        scales,
+        threshold,
+        search_left,
+        search_top,
+        search_margin,
+        require_plate,
+        mode,
+    ):
+        """Local-only guild-row match near last known / last-lost nametag.
+
+        Never searches the full screen — same-guild other players stay mitigated
+        by the local box. Returns (loc_player, match_tuple, name_equiv_loc) or None.
+        """
+        if self.img_nametag_guild is None:
+            return None
+        enable_raw = nametag_cfg.get("guild_fallback_enable", True)
+        if isinstance(enable_raw, str):
+            enable_raw = enable_raw.strip().lower() in ("1", "true", "yes", "on")
+        if not enable_raw:
+            return None
+        after = max(1, int(nametag_cfg.get("guild_fallback_after_misses", 2)))
+        if int(getattr(self, "nametag_miss_count", 0) or 0) < after:
+            return None
+
+        # Prefer last name-row lock; fall back to hold buffer.
+        last = getattr(self, "loc_nametag", None)
+        last_size = getattr(self, "nametag_last_size", None)
+        if (not last or last == (0, 0)) and getattr(self, "nametag_hold_loc", None):
+            last = self.nametag_hold_loc
+            last_size = getattr(self, "nametag_hold_size", None) or last_size
+        if not last or last == (0, 0):
+            return None
+
+        last_x, last_y = int(last[0]), int(last[1])
+        if last_size and last_size[0] > 0:
+            last_h, last_w = int(last_size[0]), int(last_size[1])
+        else:
+            track = self.img_nametag
+            last_h = int(track.shape[0]) if track is not None else 24
+            last_w = int(track.shape[1]) if track is not None else 80
+        guild_h = int(self.img_nametag_guild.shape[0])
+        # Guild sits below the name — extend the local box downward.
+        extra_down = max(
+            int(nametag_cfg.get("guild_search_extra_down", 0) or 0),
+            int(getattr(self, "nametag_guild_dy", 0) or 0) + guild_h + 8,
+            last_h + guild_h,
+        )
+        local_box = (
+            max(search_left, last_x - search_margin),
+            max(search_top, last_y - search_margin),
+            last_x + max(last_w, 1) + search_margin,
+            last_y + max(last_h, 1) + search_margin + extra_down,
+        )
+
+        if mode == "color":
+            img_guild = self.img_nametag_guild
+        elif mode == "white_mask":
+            img_guild = cv2.GaussianBlur(self.img_nametag_guild_gray, (3, 3), 0)
+            img_guild = cv2.inRange(img_guild, 150, 255)
+        elif mode == "histogram_eq":
+            g_eq = cv2.equalizeHist(self.img_nametag_guild_gray)
+            _, img_guild = cv2.threshold(g_eq, 150, 255, cv2.THRESH_BINARY)
+        else:
+            img_guild = self.img_nametag_guild_gray
+
+        mask = nametag_match_mask(self.img_nametag_guild)
+        guild_thres = float(
+            nametag_cfg.get("guild_diff_thres", max(threshold, 0.22))
+        )
+        match = find_best_nametag_match(
+            img_roi,
+            img_guild,
+            mask,
+            scales,
+            local_box,
+            require_plate=require_plate,
+        )
+        if match is None:
+            return None
+        loc_guild, score, matched_size, matched_scale = match
+        if loc_guild[0] < search_left or loc_guild[1] < search_top:
+            return None
+        matched_roi = img_roi[
+            loc_guild[1] : loc_guild[1] + matched_size[0],
+            loc_guild[0] : loc_guild[0] + matched_size[1],
+        ]
+        if score >= guild_thres:
+            occluded_threshold = float(
+                nametag_cfg.get("occluded_diff_thres", 0.40)
+            )
+            occluded_support = float(
+                nametag_cfg.get("occluded_plate_support", 0.22)
+            )
+            if not (
+                require_plate
+                and score < occluded_threshold
+                and plate_support(matched_roi) >= occluded_support
+            ):
+                return None
+        loc_player = self._nametag_pose_from_guild_match(
+            loc_guild, matched_size, matched_scale
+        )
+        name_equiv = self._nametag_name_loc_from_guild(loc_guild, matched_scale)
+        return loc_player, match, name_equiv
+
+    def _nametag_pose_from_match(self, loc_nametag, matched_size, matched_scale):
+        """Nametag top-left + size → estimated player center."""
+        _, offset_y = self.cfg["nametag"]["offset"]
+        scale_x, scale_y = matched_scale
+        return (
+            int(loc_nametag[0] + matched_size[1] // 2),
+            int(loc_nametag[1] - round(float(offset_y) * float(scale_y))),
+        )
+
+    def _nametag_remember_good(self, loc_nametag, matched_size, score, loc_player, nametag_cfg):
+        """Refresh P0 hold buffer when track score is clearly good."""
+        good_max = float(nametag_cfg.get("hold_good_score_max", 0.12))
+        hold_frames = max(1, int(nametag_cfg.get("hold_good_frames", 12)))
+        if float(score) <= good_max:
+            self.nametag_hold_remaining = hold_frames
+            self.nametag_hold_player = (int(loc_player[0]), int(loc_player[1]))
+            self.nametag_hold_loc = (int(loc_nametag[0]), int(loc_nametag[1]))
+            self.nametag_hold_size = tuple(matched_size)
+            self.nametag_hold_score = float(score)
+
+    def _nametag_return_hold(self, nametag_cfg, reason="hold"):
+        """P0: reuse last-good player pose while hold_remaining > 0."""
+        remaining = int(getattr(self, "nametag_hold_remaining", 0) or 0)
+        player = getattr(self, "nametag_hold_player", None)
+        loc = getattr(self, "nametag_hold_loc", None)
+        if remaining <= 0 or player is None or loc is None:
+            return None
+        self.nametag_hold_remaining = remaining - 1
+        # Keep local search anchored near last good nametag.
+        self.loc_nametag = loc
+        size = getattr(self, "nametag_hold_size", None) or self.nametag_last_size
+        if size and size[0] > 0:
+            self.nametag_last_size = size
+        self.nametag_last_score = float(getattr(self, "nametag_hold_score", 0.12))
+        self.nametag_match_valid = True
+        if self.img_frame_debug is not None:
+            draw_rectangle(
+                self.img_frame_debug,
+                loc,
+                self.nametag_last_size if self.nametag_last_size[0] else (24, 116),
+                (0, 200, 255),
+                "",
+            )
+            cv2.putText(
+                self.img_frame_debug,
+                f"NameTag,hold,{reason},{self.nametag_hold_remaining}",
+                (loc[0], loc[1] + (self.nametag_last_size[0] or 24) + 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 200, 255),
+                2,
+            )
+        return player
+
+    def get_player_location_by_nametag(self):
+        '''
+        Detects the player's location based on the nametag position in the game window.
+
+        This function works by:
+        - Extracting a vertical region of interest (ROI) where the nametag is expected.
+        - Ignoring the top UI strip, where the party list repeats the same name.
+        - Matching the complete nametag (hard two-row name+medal when the template
+          includes both) at several scales.
+        - Searching near the last valid position before doing a global reacquisition.
+        - Computing the player's center position by applying a fixed offset to the
+          nametag top (name-row top / full-stack top for prepared two-row crops).
+
+        Returns:
+            loc_player (tuple): The (x, y) coordinates of the player's estimated location.
+        '''
+        if self.img_nametag is None or self.img_nametag_gray is None:
+            return None
+
+        nametag_cfg = self.cfg["nametag"]
+        mode = nametag_cfg.get("mode", "color")
+        camera_bottom = self.cfg["ui_coords"]["ui_y_start"]
+
+        # Get nametag image and search image.
+        if mode == "color":
+            img_roi = self.img_frame[:camera_bottom, :]
+            img_nametag = self.img_nametag
+        elif mode == "white_mask":
+            # Apply Gaussian blur for smoother white detection
+            img_camera = cv2.GaussianBlur(
+                self.img_frame_gray[:camera_bottom, :], (3, 3), 0
+            )
+            img_nametag = cv2.GaussianBlur(self.img_nametag_gray, (3, 3), 0)
+            lower_white, upper_white = (150, 255)
+            img_roi = cv2.inRange(img_camera, lower_white, upper_white)
+            img_nametag  = cv2.inRange(img_nametag, lower_white, upper_white)
+        elif mode == "grayscale":
+            img_roi = self.img_frame_gray[:camera_bottom, :]
+            img_nametag = self.img_nametag_gray
+        elif mode == "histogram_eq":
+            # Apply histogram equalization
+            img_nametag_eq = cv2.equalizeHist(self.img_nametag_gray)
+            img_camera_eq = cv2.equalizeHist(
+                self.img_frame_gray[:camera_bottom, :]
+            )
+
+            # Apply global (fixed) threshold
+            _, img_nametag = cv2.threshold(img_nametag_eq, 150, 255, cv2.THRESH_BINARY)
+            _, img_roi = cv2.threshold(img_camera_eq, 150, 255, cv2.THRESH_BINARY)
+        else:
+            logger.error(f"Unsupported nametag detection mode: {mode}")
+            return
+
+        mask = nametag_match_mask(self.img_nametag)
+        scales = nametag_cfg.get(
+            "template_scales",
+            ((0.95, 0.90), (0.95, 0.95), (1.0, 1.0)),
+        )
+        threshold = float(nametag_cfg.get("diff_thres", 0.18))
+        search_top = max(0, int(nametag_cfg.get("search_top", 100)))
+        # Skip left HUD / minimap; top-left UI often false-locks CMS nametags.
+        search_left = max(0, int(nametag_cfg.get("search_left", 140)))
+        search_margin = max(20, int(nametag_cfg.get("search_margin", 120)))
+        reacquire_after = max(
+            1, int(nametag_cfg.get("reacquire_after_misses", 2))
+        )
+        # Keep a cached lock only while the local score stays clearly good.
+        cache_keep_thres = float(
+            nametag_cfg.get("cache_keep_thres", min(threshold, 0.14))
+        )
+
+        def _in_play_field(loc):
+            return loc[0] >= search_left and loc[1] >= search_top
+
+        require_plate = mode == "color"
+        match = None
+        match_source = "global"
+        # Drop a cached lock that already sits in the forbidden HUD strip.
+        if self.nametag_match_valid and not _in_play_field(self.loc_nametag):
+            self.nametag_match_valid = False
+            self.nametag_miss_count = reacquire_after
+
+        if self.nametag_match_valid:
+            last_height, last_width = self.nametag_last_size
+            last_x, last_y = self.loc_nametag
+            # Pad below so a full two-row stack still fits when size was stale.
+            local_box = (
+                max(search_left, last_x - search_margin),
+                max(search_top, last_y - search_margin),
+                last_x + max(last_width, 1) + search_margin,
+                last_y + max(last_height, 1) + search_margin,
+            )
+            local_match = find_best_nametag_match(
+                img_roi,
+                img_nametag,
+                mask,
+                scales,
+                local_box,
+                require_plate=require_plate,
+            )
+            local_ok = False
+            if local_match is not None and _in_play_field(local_match[0]):
+                if local_match[1] < threshold:
+                    local_ok = True
+                elif require_plate:
+                    loc, local_score, local_size, _ = local_match
+                    local_roi = img_roi[
+                        loc[1]:loc[1] + local_size[0],
+                        loc[0]:loc[0] + local_size[1],
+                    ]
+                    if (
+                        local_score < float(nametag_cfg.get("occluded_diff_thres", 0.36))
+                        and plate_support(local_roi) >= float(
+                            nametag_cfg.get("occluded_plate_support", 0.28)
+                        )
+                    ):
+                        local_ok = True
+            if local_ok:
+                local_score = local_match[1]
+                # Prefer re-search when the cached score has degraded — holding a
+                # weak "cached" lock is what drops the character in combat FX.
+                score_degraded = (
+                    local_score > cache_keep_thres
+                    or local_score > self.nametag_last_score + 0.06
+                )
+                if score_degraded:
+                    self.nametag_miss_count += 1
+                    # Fall through to global for a fresher lock.
+                    match = None
+                else:
+                    match = local_match
+                    match_source = "cached"
+                    self.nametag_miss_count = 0
+            else:
+                self.nametag_miss_count += 1
+                # Do not return None for several frames — immediately allow
+                # global reacquisition so combat FX cannot drop the player.
+                if self.nametag_miss_count < reacquire_after:
+                    # Brief grace: reuse last pose only for 1 frame if configured,
+                    # otherwise fall through to global below.
+                    pass
+                self.nametag_match_valid = False
+
+        if match is None:
+            # Name miss with a recent lock: try guild-row locally (never full-screen).
+            guild_hit = self._try_guild_nametag_fallback(
+                img_roi,
+                nametag_cfg,
+                scales,
+                threshold,
+                search_left,
+                search_top,
+                search_margin,
+                require_plate,
+                mode,
+            )
+            if guild_hit is not None:
+                loc_player, gmatch, name_equiv = guild_hit
+                loc_guild, score, matched_size, matched_scale = gmatch
+                # Anchor next name search near equivalent name-row top-left.
+                self.loc_nametag = name_equiv
+                # Keep last_size as name/track size so local name box stays sensible.
+                if self.img_nametag is not None:
+                    th, tw = self.img_nametag.shape[:2]
+                    sx, sy = matched_scale
+                    self.nametag_last_size = (
+                        max(1, int(round(th * sy))),
+                        max(1, int(round(tw * sx))),
+                    )
+                else:
+                    self.nametag_last_size = matched_size
+                self.nametag_last_score = float(score)
+                self.nametag_match_valid = True
+                self.nametag_miss_count = 0
+                self.nametag_last_source = "guild"
+                self._nametag_remember_good(
+                    name_equiv,
+                    self.nametag_last_size,
+                    score,
+                    loc_player,
+                    nametag_cfg,
+                )
+                if self.img_frame_debug is not None:
+                    draw_rectangle(
+                        self.img_frame_debug,
+                        loc_guild,
+                        matched_size,
+                        (255, 200, 0),
+                        "",
+                    )
+                    scale_x, scale_y = matched_scale
+                    text = (
+                        f"GuildTag,{round(score, 2)},guild_fb,"
+                        f"{round(scale_x, 2)}x{round(scale_y, 2)}"
+                    )
+                    cv2.putText(
+                        self.img_frame_debug,
+                        text,
+                        (loc_guild[0], loc_guild[1] + matched_size[0] + 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (255, 200, 0),
+                        2,
+                    )
+                return loc_player
+
+            # Lost lock: minimap-biased ROI + full-frame candidates, then gate.
+            # Prefer in-ROI hits; reject a strong out-of-ROI score when an
+            # acceptable in-ROI peak exists (anti false-lock at wrong y).
+            biased_box = self._nametag_reacquire_box_from_minimap(
+                img_roi.shape[1],
+                img_roi.shape[0],
+                search_left,
+                search_top,
+            )
+            global_box = (
+                search_left,
+                search_top,
+                img_roi.shape[1],
+                img_roi.shape[0],
+            )
+            biased_cands = find_nametag_match_candidates(
+                img_roi,
+                img_nametag,
+                mask,
+                scales,
+                biased_box,
+                require_plate=require_plate,
+                top_k=8,
+                max_keep=6,
+            )
+            global_cands = find_nametag_match_candidates(
+                img_roi,
+                img_nametag,
+                mask,
+                scales,
+                global_box,
+                require_plate=require_plate,
+                top_k=8,
+                max_keep=6,
+            )
+            merged = []
+            for src, group in (("minimap_bias", biased_cands), ("global", global_cands)):
+                for cand in group:
+                    merged.append((cand, src))
+            flat = [c for c, _src in merged]
+            gated = pick_nametag_candidate(
+                flat,
+                prefer_box=biased_box,
+                threshold=threshold,
+                accept_thres=float(
+                    nametag_cfg.get("occluded_diff_thres", 0.36)
+                ),
+                min_peak_sep=int(nametag_cfg.get("ambiguity_min_sep", 90)),
+            )
+            if gated is not None:
+                match = gated
+                gx, gy = int(gated[0][0]), int(gated[0][1])
+                bx0, by0, bx1, by1 = biased_box
+                in_bias = bx0 <= gx < bx1 and by0 <= gy < by1
+                match_source = "roi_gate" if in_bias else "global_fallback"
+                for cand, src in merged:
+                    if (
+                        int(cand[0][0]) == gx
+                        and int(cand[0][1]) == gy
+                        and abs(float(cand[1]) - float(gated[1])) < 1e-6
+                    ):
+                        if src == "minimap_bias":
+                            match_source = "minimap_bias"
+                        elif in_bias:
+                            match_source = "roi_gate"
+                        else:
+                            match_source = "global_fallback"
+                        break
+
+        if match is None:
+            held = self._nametag_return_hold(nametag_cfg, "no_match")
+            if held is not None:
+                return held
+            return None
+        loc_nametag, score, matched_size, matched_scale = match
+        # Hard reject HUD / minimap false positives even if matcher returned them.
+        if not _in_play_field(loc_nametag):
+            held = self._nametag_return_hold(nametag_cfg, "hud")
+            if held is not None:
+                return held
+            self.nametag_match_valid = False
+            return None
+        matched_roi = img_roi[
+            loc_nametag[1]:loc_nametag[1] + matched_size[0],
+            loc_nametag[0]:loc_nametag[0] + matched_size[1],
+        ]
+        if score >= threshold:
+            # Overlapping monster/player names inflate SQDIFF. Keep the hit if
+            # the matched region is still clearly a cyan nameplate.
+            occluded_threshold = float(nametag_cfg.get("occluded_diff_thres", 0.40))
+            occluded_support = float(nametag_cfg.get("occluded_plate_support", 0.22))
+            if not (
+                require_plate
+                and score < occluded_threshold
+                and plate_support(matched_roi) >= occluded_support
+            ):
+                held = self._nametag_return_hold(nametag_cfg, "score")
+                if held is not None:
+                    return held
+                return None
+            match_source = "occluded"
+
+        # P1: reject weak Y jumps away from last-good lock (combat false peaks).
+        prev_loc = getattr(self, "nametag_hold_loc", None)
+        if prev_loc is None and self.nametag_match_valid:
+            prev_loc = getattr(self, "loc_nametag", None)
+        max_jump_y = max(8, int(nametag_cfg.get("max_jump_y", 30)))
+        jump_reject_score = float(nametag_cfg.get("jump_reject_score", 0.15))
+        if prev_loc is not None:
+            dy = abs(int(loc_nametag[1]) - int(prev_loc[1]))
+            if dy > max_jump_y and float(score) > jump_reject_score:
+                held = self._nametag_return_hold(nametag_cfg, f"yjump{dy}")
+                if held is not None:
+                    return held
+                self.nametag_match_valid = False
+                return None
+
+        # Dual template: track=1-layer for localization; verify=full stack on
+        # reacquire / new locks (skip cached local holds to save FPS).
+        verify_score = None
+        verify_on = nametag_cfg.get("verify_on_reacquire", True)
+        if isinstance(verify_on, str):
+            verify_on = verify_on.strip().lower() in ("1", "true", "yes", "on")
+        if (
+            getattr(self, "nametag_dual_enabled", False)
+            and verify_on
+            and match_source != "cached"
+        ):
+            ok, verify_score = self._nametag_verify_candidate(
+                img_roi, loc_nametag, matched_scale, nametag_cfg
+            )
+            self.nametag_last_verify_score = (
+                float(verify_score) if verify_score is not None else 1.0
+            )
+            if not ok:
+                # P1: weak track + failed verify must not commit; P0 hold instead.
+                require_track = float(
+                    nametag_cfg.get("verify_require_track_score", 0.18)
+                )
+                held = self._nametag_return_hold(
+                    nametag_cfg,
+                    "verify_weak" if float(score) > require_track else "verify",
+                )
+                if held is not None:
+                    return held
+                self.nametag_match_valid = False
+                return None
+            match_source = f"{match_source}+verify"
+
+        # loc_nametag is the top-left of the matched template. For hard two-row
+        # templates this is the full stack top (≈ name-row top). matched_size is
+        # the scaled full template (name+medal) so the debug box covers both rows.
+        # Player pose uses nametag top-center minus offset_y (name-row top → body).
+        self.loc_nametag = loc_nametag
+        self.nametag_last_size = matched_size
+        self.nametag_last_score = float(score)
+        self.nametag_match_valid = True
+        self.nametag_miss_count = 0
+        self.nametag_last_source = "name"
+
+        # Pre-change / upstream behavior: only offset_y is applied.
+        # offset[0] is ignored so config defaults like [-50, 30] do not shift X.
+        scale_x, scale_y = matched_scale
+        loc_player = self._nametag_pose_from_match(
+            loc_nametag, matched_size, matched_scale
+        )
+        self._nametag_remember_good(
+            loc_nametag, matched_size, score, loc_player, nametag_cfg
+        )
+
+        # Draw name tag detection box for debugging (full two-row when applicable)
+        if self.img_frame_debug is not None:
+            draw_rectangle(self.img_frame_debug, self.loc_nametag,
+                           matched_size, (0, 255, 0), "")
+            vpart = ""
+            if getattr(self, "nametag_dual_enabled", False):
+                vs = getattr(self, "nametag_last_verify_score", None)
+                if vs is not None and match_source != "cached":
+                    vpart = f",v{round(float(vs), 2)}"
+                else:
+                    vpart = ",track"
+            text = (
+                f"NameTag,{round(score, 2)},{match_source}{vpart},"
+                f"{round(scale_x, 2)}x{round(scale_y, 2)}"
+            )
+            cv2.putText(self.img_frame_debug, text,
+                        (self.loc_nametag[0],
+                         self.loc_nametag[1] + matched_size[0] + 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        return loc_player
+
+
+    def get_player_location_by_party_red_bar(self):
+        '''
+        get_player_location_by_party_red_bar
+        '''
+        # Zero out minimap area in the img_frame
+        img_frame = self.img_frame.copy()
+        x, y = self.loc_minimap
+        h, w = self.img_minimap.shape[:2]
+        img_frame[y:y+h, x:x+w] = 0
+
+        # Get camera area
+        img_camera = img_frame[:self.cfg["ui_coords"]["ui_y_start"], :]
+
+        # Convert to HSV
+        img_hsv = cv2.cvtColor(img_camera, cv2.COLOR_BGR2HSV)
+        lower_red = to_opencv_hsv(self.cfg["party_red_bar"]["lower_red"])
+        upper_red = to_opencv_hsv(self.cfg["party_red_bar"]["upper_red"])
+        mask_red = cv2.inRange(img_hsv, lower_red, upper_red)
+        # cv2.imshow("mask_red", mask_red)
+
+        # Find contours on mask_red
+        contours, _ = cv2.findContours(mask_red, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+
+        # Filter contour by specific geometry trait of red bar
+        boxs = []
+        for c in contours:
+            x, y, w, h = cv2.boundingRect(c)
+            area = cv2.contourArea(c)
+            fill_rate = float(area) / (h*w)
+            if 5 <= h <= 7 and 1 <= w <= 50 and 10 <= area and fill_rate >= 0.7:
+                # cv2.drawContours(self.img_frame_debug, [c], -1, (0, 255, 0), 1)
+                boxs.append((x, y, w, h))
+
+        if not boxs:
+            return None, None  # red bar not found
+
+        # Sort box by area
+        boxs.sort(key=lambda box: box[2] * box[3], reverse=True)
+
+        # Consider the biggest area as party red bar
+        x, y, w, h = boxs[0]
+
+        # Offset coordinate
+        loc_party_red_bar = (x, y)
+        loc_player = (x + self.cfg["party_red_bar"]["offset"][0],
+                      y + self.cfg["party_red_bar"]["offset"][1])
+
+        # visualize for debug
+        if self.img_frame_debug is not None:
+            draw_rectangle(self.img_frame_debug, loc_party_red_bar,
+                        (h, w), (0, 255, 0), "party red bar", thickness=1, text_height=0.4)
+
+        return loc_player, loc_party_red_bar
+
+    def _smart_patrol_phase(self):
+        fsm = getattr(self, "fsm", None)
+        state = getattr(fsm, "state", None) if fsm is not None else None
+        return getattr(state, "phase", None)
+
+    def _need_debug_canvas_this_frame(self):
+        """Allocate a full-frame debug copy only when overlay/recording needs it."""
+        self._debug_canvas_this_frame = False
+        if self.video_writer:
+            self._debug_canvas_this_frame = True
+            return True
+        if not self.is_show_debug_window:
+            return False
+        debug_ui_fps = max(
+            1.0,
+            float(self.cfg.get("system", {}).get("fps_limit_debug_ui", 10) or 10),
+        )
+        now = time.time()
+        if now - float(getattr(self, "t_last_debug_ui", 0.0)) >= 1.0 / debug_ui_fps:
+            self._debug_canvas_this_frame = True
+            return True
+        return False
+
+    def _need_frame_gray(self):
+        nametag_cfg = self.cfg.get("nametag") or {}
+        if not nametag_cfg.get("enable"):
+            return False
+        mode = str(nametag_cfg.get("mode", "color")).lower()
+        if mode == "color":
+            return False
+        return self._should_run_nametag()
+
+    def _should_run_nametag(self):
+        """Nametag is costly; skip in smart_patrol Scan/Return when minimap is OK."""
+        cached = getattr(self, "_nametag_run_this_frame", None)
+        if cached is not None:
+            return cached
+        nametag_cfg = self.cfg.get("nametag") or {}
+        if not nametag_cfg.get("enable"):
+            self._nametag_run_this_frame = False
+            return False
+        if self.cfg.get("bot", {}).get("mode") != "smart_patrol":
+            self._nametag_run_this_frame = True
+            return True
+        phase = self._smart_patrol_phase()
+        if phase == "engage" or self.is_engaging():
+            self._nametag_run_this_frame = True
+            return True
+        skip_ok = nametag_cfg.get("skip_when_minimap_ok", True)
+        if isinstance(skip_ok, str):
+            skip_ok = skip_ok.strip().lower() in ("1", "true", "yes", "on")
+        if not skip_ok:
+            self._nametag_run_this_frame = True
+            return True
+        if not getattr(self, "is_player_minimap_detected", False):
+            self._nametag_run_this_frame = True
+            return True
+        try:
+            scan_n = int(nametag_cfg.get("scan_every_n_frames", 0) or 0)
+        except (TypeError, ValueError):
+            scan_n = 0
+        if scan_n <= 0:
+            self._nametag_run_this_frame = False
+            return False
+        self._nametag_scan_tick = int(getattr(self, "_nametag_scan_tick", 0)) + 1
+        run = (self._nametag_scan_tick % scan_n) == 0
+        self._nametag_run_this_frame = run
+        return run
+
+    def _should_run_monster_detect(self):
+        """Throttle template matching in smart_patrol Scan/Return; Engage always."""
+        try:
+            n = int(
+                (self.cfg.get("monster_detect") or {}).get("detect_every_n_frames", 1)
+                or 1
+            )
+        except (TypeError, ValueError):
+            n = 1
+        n = max(1, n)
+        if n <= 1:
+            return True
+        if self.cfg.get("bot", {}).get("mode") != "smart_patrol":
+            return True
+        if self._smart_patrol_phase() == "engage" or self.is_engaging():
+            return True
+        tick = int(getattr(self, "_monster_detect_tick", 0))
+        run = (tick % n) == 0
+        self._monster_detect_tick = tick + 1
+        return run
+
+
+    def _shutdown_monitor_cfg(self):
+        return self.cfg.get("shutdown_monitor", {}) if isinstance(self.cfg, dict) else {}
+
+    def _request_windows_shutdown(self, delay_sec, reason=""):
+        delay_sec = max(0, int(delay_sec))
+        try:
+            cmd = f"cmd /c shutdown /s /t {delay_sec}"
+            subprocess.Popen(cmd, shell=True)
+            self._shutdown_pending = True
+            logger.warning(f"[ShutdownMonitor] 已请求关机：{cmd} ({reason})")
+            return True
+        except Exception as err:
+            logger.error(f"[ShutdownMonitor] 关机请求失败: {err}")
+            return False
+
+    def _cancel_windows_shutdown(self, reason=""):
+        try:
+            subprocess.Popen("cmd /c shutdown /a", shell=True)
+            if getattr(self, "_shutdown_pending", False):
+                logger.info(f"[ShutdownMonitor] 已取消关机 ({reason})")
+            self._shutdown_pending = False
+        except Exception as err:
+            logger.error(f"[ShutdownMonitor] 取消关机失败: {err}")
+
+    def _update_shutdown_lost_monitor(self, player_found):
+        """Fire shutdown once if character missing continuously for lost_seconds."""
+        sm = self._shutdown_monitor_cfg()
+        if not sm.get("lost_enable"):
+            self._shutdown_lost_since = None
+            self._shutdown_lost_fired = False
+            return
+        now = time.time()
+        if player_found:
+            self._shutdown_lost_since = None
+            return
+        if self._shutdown_lost_since is None:
+            self._shutdown_lost_since = now
+            return
+        lost_seconds = float(sm.get("lost_seconds", 60) or 60)
+        elapsed = now - self._shutdown_lost_since
+        if elapsed < lost_seconds:
+            return
+        if self._shutdown_lost_fired:
+            return
+        delay = int(sm.get("shutdown_delay_sec", 60) or 60)
+        if self._request_windows_shutdown(
+            delay,
+            reason=f"找不到主角连续 {int(elapsed)}s >= {int(lost_seconds)}s",
+        ):
+            self._shutdown_lost_fired = True
+
+
+    def get_player_location(self):
+        """Locate the player without requiring a party health bar."""
+        detect_cfg = self.cfg.get("player_detect", {})
+        mode = detect_cfg.get("mode", "auto")
+
+        if mode in ("auto", "nametag") and self.cfg["nametag"].get("enable"):
+            if self._should_run_nametag():
+                loc_player = self.get_player_location_by_nametag()
+                if loc_player is not None:
+                    return loc_player
+            elif self.loc_player != (0, 0):
+                # Scan/Return: reuse last attack-center while minimap is driving motion.
+                return self.loc_player
+            if mode == "nametag":
+                return self._get_player_location_fallback(detect_cfg)
+
+        party_enabled = self.cfg["party_red_bar"].get("enable", False)
+        if mode in ("auto", "party_red_bar") and party_enabled:
+            loc_player, loc_party_red_bar = self.get_player_location_by_party_red_bar()
+            if loc_party_red_bar is not None:
+                self.loc_party_red_bar = loc_party_red_bar
+            if loc_player is not None:
+                return loc_player
+            if mode == "party_red_bar":
+                return self._get_player_location_fallback(detect_cfg)
+
+        return self._get_player_location_fallback(detect_cfg)
+
+    def _get_player_location_fallback(self, detect_cfg):
+        if detect_cfg.get("fallback_to_last", True) and self.loc_player != (0, 0):
+            return self.loc_player
+
+        ratio_x, ratio_y = detect_cfg.get("screen_anchor_ratio", (0.5, 0.55))
+        camera_height = min(self.cfg["ui_coords"]["ui_y_start"], self.img_frame.shape[0])
+        return (
+            int(self.img_frame.shape[1] * float(ratio_x)),
+            int(camera_height * float(ratio_y)),
+        )
+
+    def get_player_location_on_global_map(self):
+        '''
+        get_player_location_on_global_map
+        '''
+        last_result = None if self.is_first_frame else self.loc_minimap_global
+        self.loc_minimap_global, score, _ = match_minimap_on_map(
+            self.img_map,
+            self.img_minimap,
+            last_result=last_result,
+        )
+
+        x_offset, y_offset = self.cfg["minimap"]["offset"]
+        loc_player_global = (
+            self.loc_minimap_global[0] + self.loc_player_minimap[0] + x_offset,
+            self.loc_minimap_global[1] + self.loc_player_minimap[1] + y_offset
+        )
+
+        # Draw local minimap rectangle
+        camera_bottom_right = (
+            self.loc_minimap_global[0] + self.img_minimap.shape[1],
+            self.loc_minimap_global[1] + self.img_minimap.shape[0]
+        )
+        cv2.rectangle(self.img_route_debug, self.loc_minimap_global,
+                      camera_bottom_right, (0, 255, 255), 1)
+        cv2.putText(
+            self.img_route_debug,
+            f"Minimap,score({round(score, 2)})",
+            (self.loc_minimap_global[0], self.loc_minimap_global[1]+15),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+            (0, 255, 255), 1
+        )
+
+        # Draw player center
+        cv2.circle(self.img_route_debug,
+                   loc_player_global, radius=2,
+                   color=(0, 255, 255), thickness=-1)
+
+        return loc_player_global
+
+    def get_nearest_color_code(self):
+        '''
+        Searches for the nearest color-coded action marker
+        around the player on the route map.
+
+        This function:
+        - Scans each pixel in the search box to find nearest color code
+        - Tracks the closest matching pixel using Manhattan distance (|dx| + |dy|).
+        - Returns a dictionary containing the nearest matching
+          pixel's position, color, action label, and distance.
+
+        Returns:
+            dict or None: Dictionary containing:
+                - "pixel": (x, y) coordinate of the matched pixel
+                - "color": matched RGB color tuple
+                - "action": corresponding action string from config
+                - "distance": Manhattan distance from player
+            Returns None if no matching color is found within the region.
+        '''
+        x0, y0 = self.loc_player_global
+        h, w = self.img_route.shape[:2]
+        x_min = max(0, x0 - self.cfg["route"]["search_range"])
+        x_max = min(w, x0 + self.cfg["route"]["search_range"])
+        y_min = max(0, y0 - self.cfg["route"]["search_range"])
+        y_max = min(h, y0 + self.cfg["route"]["search_range"])
+
+        nearest = None
+        nearest_up_down = None
+        min_dist = float('inf')
+        min_dist_up_down = float('inf')
+        for y in range(y_min, y_max):
+            for x in range(x_min, x_max):
+                pixel = tuple(self.img_route[y, x])  # (R, G, B)
+                dist = abs(x - x0) + abs(y - y0)
+                # Get nearest color
+                if pixel in self.color_code and dist < min_dist:
+                    nearest = {
+                        "pixel": (x, y),
+                        "color": pixel,
+                        "command": self.color_code[pixel],
+                        "distance": dist
+                    }
+                    min_dist = dist
+                # Get nearest color (up, dowm)
+                if pixel in self.color_code_up_down and dist < min_dist_up_down:
+                    nearest_up_down = {
+                        "pixel": (x, y),
+                        "color": pixel,
+                        "command": self.color_code_up_down[pixel],
+                        "distance": dist
+                    }
+                    min_dist_up_down = dist
+
+        # Debug
+        draw_rectangle(
+            self.img_route_debug,
+            (x_min, y_min),
+            (self.cfg["route"]["search_range"]*2,
+             self.cfg["route"]["search_range"]*2),
+            (0, 0, 255), "", text_height=0.4, thickness=1,
+        )
+        # Draw a straigt line from map_loc_player to color_code["pixel"]
+        if nearest is not None:
+            cv2.line(
+                self.img_route_debug,
+                self.loc_player_global, # start point
+                nearest["pixel"],       # end point
+                (0, 255, 0),            # green line
+                1                       # thickness
+            )
+            # Print color code on debug image
+            if self.img_frame_debug is not None:
+                cv2.putText(
+                    self.img_frame_debug, f"Route Action: {nearest['command']}",
+                    (650, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255),
+                    2, cv2.LINE_AA
+                )
+                cv2.putText(
+                    self.img_frame_debug, f"Route Index: {self.idx_routes}",
+                    (650, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255),
+                    2, cv2.LINE_AA
+                )
+
+        if nearest_up_down is not None:
+            if self.img_frame_debug is not None:
+                cv2.putText(
+                    self.img_frame_debug, f"Route Action: {nearest_up_down['command']}",
+                    (650, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255),
+                    2, cv2.LINE_AA
+                )
+            cv2.line(
+                self.img_route_debug,
+                self.loc_player_global,  # start point
+                nearest_up_down["pixel"],# end point
+                (0, 0, 255),             # green line
+                1                        # thickness
+            )
+
+        return nearest, nearest_up_down  # if not found return none
+
+    def get_attack_range(self, is_left=True):
+        '''
+        get_attack_range
+        '''
+        if self.cfg["bot"]["attack"] == "aoe_skill":
+            dx = self.cfg["aoe_skill"]["range_x"] // 2
+            dy = self.cfg["aoe_skill"]["range_y"] // 2
+            x0 = max(0, self.loc_player[0] - dx)
+            x1 = min(self.img_frame.shape[1], self.loc_player[0] + dx)
+            y0 = max(0, self.loc_player[1] - dy)
+            y1 = min(self.img_frame.shape[0], self.loc_player[1] + dy)
+
+        elif self.cfg["bot"]["attack"] in ("directional", "hybrid"):
+            if is_left:
+                x0 = max(
+                    0,
+                    self.loc_player[0] - self.cfg["directional_attack"]["range_x"],
+                )
+                x1 = self.loc_player[0]
+            else:
+                x0 = self.loc_player[0]
+                x1 = min(
+                    self.img_frame.shape[1],
+                    x0 + self.cfg["directional_attack"]["range_x"],
+                )
+            half_height = self.cfg["directional_attack"]["range_y"] // 2
+            y0 = max(0, self.loc_player[1] - half_height)
+            y1 = min(self.img_frame.shape[0], self.loc_player[1] + half_height)
+        else:
+            raise RuntimeError(f"Unsupported attack mode: {self.cfg['bot']['attack']}")
+
+        return (x0, y0, x1, y1)
+
+    def get_aoe_attack_range(self):
+        """Return the centered range used by AoE and hybrid crowd counting."""
+        dx = self.cfg["aoe_skill"]["range_x"] // 2
+        dy = self.cfg["aoe_skill"]["range_y"] // 2
+        return (
+            max(0, self.loc_player[0] - dx),
+            max(0, self.loc_player[1] - dy),
+            min(self.img_frame.shape[1], self.loc_player[0] + dx),
+            min(self.img_frame.shape[0], self.loc_player[1] + dy),
+        )
+
+    def count_monsters_in_aoe_range(self):
+        """Count independent detected monsters whose centers are in the AoE box."""
+        x0, y0, x1, y1 = self.get_aoe_attack_range()
+        count = 0
+        for monster in self.monsters:
+            mx, my = monster["position"]
+            width, height = monster["size"]
+            center_x = mx + width // 2
+            center_y = my + height // 2
+            if x0 <= center_x <= x1 and y0 <= center_y <= y1:
+                count += 1
+        return count
+
+    def get_nearest_monster(self, is_left=True, monsters=None):
+        '''
+        Finds the nearest monster within the player's attack range.
+
+        This function:
+        - Defines an attack box relative to the player position,
+            depending on the facing direction (`is_left`).
+        - Iterates through all detected monsters and checks which ones overlap
+          with the attack box.
+        - Returns the closest valid monster that meets the overlap criteria.
+
+        Args:
+            is_left (bool): If True, assume the player is facing left;
+                            adjusts attack box accordingly.
+        Returns:
+            dict or None: The nearest monster's info dict, or None if no valid match.
+        '''
+
+        x0, y0, x1, y1 = self.get_attack_range(is_left=is_left)
+
+        nearest_monster = None
+        min_distance = float('inf')
+        template_areas = [
+            img.shape[0] * img.shape[1]
+            for _, imgs in self.monsters_info.items()
+            for img, _ in imgs
+        ]
+        max_trigger_area = self.cfg['monster_detect']['max_mob_area_trigger']
+        reference_area = min(template_areas, default=max_trigger_area)
+        inter_area_thres = min(reference_area, max_trigger_area)
+        monster_list = monsters if monsters is not None else (
+            getattr(self, "decision_monsters", None) or self.monsters
+        )
+        for monster in monster_list:
+            mx1, my1 = monster["position"]
+            mw, mh = monster["size"]
+            mx2 = mx1 + mw
+            my2 = my1 + mh
+
+            # Calculate intersection
+            ix1 = max(x0, mx1)
+            iy1 = max(y0, my1)
+            ix2 = min(x1, mx2)
+            iy2 = min(y1, my2)
+
+            iw = max(0, ix2 - ix1)
+            ih = max(0, iy2 - iy1)
+            inter_area = iw * ih
+            attack_area = max(1, (x1 - x0) * (y1 - y0))
+            monster_area = max(1, mw * mh)
+            # Don't require nearly the whole template inside the attack box.
+            # A 130px-wide box otherwise misses pigs that only overlap the edge.
+            need = min(
+                inter_area_thres,
+                max(80, int(min(attack_area, monster_area) * 0.15)),
+            )
+            in_range = inter_area >= need
+            if not in_range:
+                # Hit/die poses often miss templates; a green HP bar over the
+                # attack box is still a live in-range target.
+                in_range = hp_bar_in_attack_box(monster, (x0, y0, x1, y1))
+            if in_range:
+                # Compute distance to player center
+                monster_center = (mx1 + mw // 2, my1 + mh // 2)
+                dx = monster_center[0] - self.loc_player[0]
+                dy = monster_center[1] - self.loc_player[1]
+                distance = abs(dx) + abs(dy)  # Manhattan distance
+
+                if distance < min_distance:
+                    min_distance = distance
+                    nearest_monster = monster
+
+        return nearest_monster
+
+    def _hp_bar_body_size(self):
+        """Sprite box under an HP bar: median loaded template, else a boar-sized default."""
+        widths = []
+        heights = []
+        for _name, imgs in (self.monsters_info or {}).items():
+            for img, _mask in imgs:
+                if img is None or getattr(img, "size", 0) == 0:
+                    continue
+                heights.append(int(img.shape[0]))
+                widths.append(int(img.shape[1]))
+        if not widths:
+            return (56, 52)
+        widths.sort()
+        heights.sort()
+        mid = len(widths) // 2
+        return (max(32, widths[mid]), max(28, heights[mid]))
+
+    def get_monsters_in_range(self, top_left, bottom_right):
+        '''
+        get_monsters_in_range
+        '''
+        x0, y0 = top_left
+        x1, y1 = bottom_right
+
+        img_roi = self.img_frame[y0:y1, x0:x1]
+
+        # Shift player's location into ROI coordinate system
+        px, py = self.loc_player
+        px_in_roi = px - x0
+        py_in_roi = py - y0
+
+        # Define rectangle range around player (in ROI coordinate)
+        char_x_min = max(0, px_in_roi - self.cfg["character"]["width"] // 2)
+        char_x_max = min(img_roi.shape[1], px_in_roi + self.cfg["character"]["width"] // 2)
+        char_y_min = max(0, py_in_roi - self.cfg["character"]["height"] // 2)
+        char_y_max = min(img_roi.shape[0], py_in_roi + self.cfg["character"]["height"] // 2)
+
+        monsters = []
+        detect_mode = self.cfg["monster_detect"]["mode"]
+
+        # Template-free mode must also work when the selected map has no bound monsters.
+        if detect_mode == "template_free":
+            black_mask = np.all(img_roi == [0, 0, 0], axis=2).astype(np.uint8) * 255
+            black_mask[char_y_min:char_y_max, char_x_min:char_x_max] = 0
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
+            closed_mask = cv2.morphologyEx(black_mask, cv2.MORPH_CLOSE, kernel)
+            num_labels, _, stats, _ = cv2.connectedComponentsWithStats(
+                closed_mask, connectivity=8
+            )
+            for i in range(1, num_labels):
+                x, y, w, h, area = stats[i]
+                if area > 1000:
+                    monsters.append({
+                        "name": "Template Free",
+                        "position": (x0 + x, y0 + y),
+                        "size": (w, h),
+                        "score": 1.0,
+                    })
+
+        monster_templates = self.monsters_info.items() if detect_mode != "template_free" else []
+        # contour_only: blur the ROI once per frame instead of once per template.
+        contour_roi_blur = None
+        if detect_mode == "contour_only" and self.cfg["bot"]["mode"] != "patrol":
+            blur = int(self.cfg["monster_detect"].get("contour_blur", 5) or 5)
+            if blur < 1:
+                blur = 1
+            if blur % 2 == 0:
+                blur += 1
+            mask_roi = np.all(img_roi == [0, 0, 0], axis=2).astype(np.uint8) * 255
+            mask_roi[char_y_min:char_y_max, char_x_min:char_x_max] = 0
+            contour_roi_blur = cv2.GaussianBlur(mask_roi, (blur, blur), 0)
+
+        for monster_name, monster_imgs in monster_templates:
+            contour_patterns = self.monsters_contour_patterns.get(monster_name)
+            for idx, (img_monster, mask_monster) in enumerate(monster_imgs):
+                if self.cfg["bot"]["mode"] == "patrol":
+                    pass # Don't detect monster using template in patrol mode
+                elif self.cfg["monster_detect"]["mode"] == "contour_only":
+                    # Use only black lines contour to detect monsters
+                    if contour_patterns is not None and idx < len(contour_patterns):
+                        img_monster_blur = contour_patterns[idx]
+                    else:
+                        black_pixels = np.all(img_monster == [0, 0, 0], axis=2)
+                        visible_pixels = mask_monster > 0
+                        mask_pattern = (black_pixels & visible_pixels).astype(np.uint8) * 255
+                        blur = int(self.cfg["monster_detect"].get("contour_blur", 5) or 5)
+                        if blur % 2 == 0:
+                            blur += 1
+                        img_monster_blur = cv2.GaussianBlur(mask_pattern, (blur, blur), 0)
+
+                    img_roi_blur = contour_roi_blur
+                    if img_roi_blur is None:
+                        continue
+
+                    # Check template vs ROI size before matching
+                    h_roi, w_roi = img_roi_blur.shape[:2]
+                    h_temp, w_temp = img_monster_blur.shape[:2]
+
+                    if h_temp > h_roi or w_temp > w_roi:
+                        continue  # Skip only this template; other sources may still match.
+
+                    # Perform template matching
+                    res = cv2.matchTemplate(img_roi_blur, img_monster_blur, cv2.TM_SQDIFF_NORMED)
+
+                    # Apply soft threshold
+                    match_locations = np.where(res <= self.cfg["monster_detect"]["diff_thres"])
+
+                    h, w = img_monster.shape[:2]
+                    for pt in zip(*match_locations[::-1]):
+                        monsters.append({
+                            "name": monster_name,
+                            "position": (pt[0] + x0, pt[1] + y0),
+                            "size": (w, h),
+                            "score": res[pt[1], pt[0]],
+                        })
+                elif self.cfg["monster_detect"]["mode"] == "grayscale":
+                    img_monster_gray = cv2.cvtColor(img_monster, cv2.COLOR_BGR2GRAY)
+                    img_roi_gray = cv2.cvtColor(img_roi, cv2.COLOR_BGR2GRAY)
+                    res = cv2.matchTemplate(
+                            img_roi_gray,
+                            img_monster_gray,
+                            cv2.TM_SQDIFF_NORMED,
+                            mask=mask_monster)
+                    match_locations = np.where(res <= self.cfg["monster_detect"]["diff_thres"])
+                    h, w = img_monster.shape[:2]
+                    for pt in zip(*match_locations[::-1]):
+                        monsters.append({
+                            "name": monster_name,
+                            "position": (pt[0] + x0, pt[1] + y0),
+                            "size": (w, h),
+                            "score": res[pt[1], pt[0]],
+                    })
+                elif self.cfg["monster_detect"]["mode"] == "color":
+                    res = cv2.matchTemplate(
+                            img_roi,
+                            img_monster,
+                            cv2.TM_SQDIFF_NORMED,
+                            mask=mask_monster)
+                    match_locations = np.where(res <= self.cfg["monster_detect"]["diff_thres"])
+                    h, w = img_monster.shape[:2]
+                    for pt in zip(*match_locations[::-1]):
+                        monsters.append({
+                            "name": monster_name,
+                            "position": (pt[0] + x0, pt[1] + y0),
+                            "size": (w, h),
+                            "score": res[pt[1], pt[0]],
+                    })
+                else:
+                    logger.error(f"Unexpected camera localization mode: {self.cfg['monster_detect']['mode']}")
+                    return []
+
+        # Apply Non-Maximum Suppression to monster detection
+        monsters = nms(monsters, iou_threshold=0.4)
+
+        # Auxiliary: neon-green HP bar (black outline) above hit monsters.
+        # Exact BGR match of hp_bar_color is too brittle; geometry + fill is used.
+        md_cfg = self.cfg.get("monster_detect") or {}
+        if md_cfg.get("with_enemy_hp_bar", True):
+            body_size = self._hp_bar_body_size()
+            hp_monsters = detect_monster_hp_bars(
+                img_roi,
+                origin=(x0, y0),
+                body_size=body_size,
+            )
+            monsters = merge_hp_bar_detections(monsters, hp_monsters)
+
+        # Debug overlays only when the monitor tab is active.
+        if self.is_show_debug_window and self.img_frame_debug is not None:
+            draw_rectangle(
+                self.img_frame_debug, (x0, y0), (y1-y0, x1-x0),
+                (255, 0, 0), "Mob Detection Box"
+            )
+            for monster in monsters:
+                if monster.get("source") == "hp_bar" or monster.get("name") == "Health Bar":
+                    color = (0, 255, 255)
+                elif monster.get("has_hp_bar"):
+                    color = (0, 220, 180)
+                else:
+                    color = (0, 255, 0)
+                draw_rectangle(
+                    self.img_frame_debug,
+                    monster["position"],
+                    (monster["size"][1], monster["size"][0]),
+                    color, str(round(monster['score'], 2))
+                )
+                bar = monster.get("hp_bar")
+                if bar and len(bar) >= 4:
+                    bx, by, bw, bh = (int(v) for v in bar[:4])
+                    cv2.rectangle(
+                        self.img_frame_debug,
+                        (bx, by),
+                        (bx + max(1, bw), by + max(1, bh)),
+                        (255, 0, 255),
+                        1,
+                    )
+
+        # Health-bar and image-template detectors may describe the same mob.
+        # Run one final suppression pass so hybrid mode does not count it twice.
+        return nms(monsters, iou_threshold=0.3)
+
+    def get_img_frame(self, log_failure=True):
+        '''
+        get_img_frame
+        '''
+        # Get window game raw frame
+        self.frame = self.capture.get_frame()
+        if self.frame is None:
+            if log_failure:
+                logger.warning("Failed to capture game frame.")
+            return
+
+        # Windows capture now returns the exact game client area. Legacy/macOS
+        # backends may still include their title bar and keep the old path.
+        if getattr(self.capture, "returns_client_frame", False):
+            frame_no_title = self.frame
+        else:
+            frame_no_title = self.frame[
+                self.cfg["game_window"]["title_bar_height"]:, :
+            ]
+
+        # Make sure the window ratio is as expected
+        if self.args.test_image != "":
+            pass # Disable size check if using test image for debugging
+        elif getattr(self.capture, "returns_client_frame", False):
+            if not is_img_16_to_9(frame_no_title, self.cfg):
+                text = f"Unexpeted window size: {frame_no_title.shape[:2]} (expect window ratio 16:9)\n"
+                text += "Please use windowed mode & smallest resolution."
+                if log_failure:
+                    logger.error(text)
+                return
+        elif self.cfg["bot"]["mode"] == "aux":
+            if not is_img_16_to_9(frame_no_title, self.cfg): # Aux mode allow 16:9 resolution
+                text = f"Unexpeted window size: {frame_no_title.shape[:2]} (expect window ratio 16:9)\n"
+                text += "Please use windowed mode & smallest resolution."
+                if log_failure:
+                    logger.error(text)
+                return
+        else:
+            # Other mode only allow specific resolution
+            if self.cfg["game_window"]["size"] != frame_no_title.shape[:2]:
+                text = f"Unexpeted window size: {frame_no_title.shape[:2]} "\
+                       f"(expect {self.cfg['game_window']['size']})\n"
+                text += "Please use windowed mode & smallest resolution."
+                if log_failure:
+                    logger.error(text)
+                return
+
+        return cv2.resize(frame_no_title, WINDOW_WORKING_SIZE,
+                   interpolation=cv2.INTER_NEAREST)
+
+    def get_immobile_seconds(self):
+        """
+        Seconds since the player last moved beyond watchdog.range.
+        Resets the watchdog when movement is detected; does not pulse-reset
+        on timeout so callers can track continuous stuck duration.
+
+        Recent combat activity (Hybrid/AoE/directional attack or engage-hold)
+        also resets the immobile clock so intentional standing AoE farming
+        does not trigger Recovery false-stuck.
+        """
+        if self.loc_player_global is None or self.loc_watch_dog is None:
+            return 0.0
+        try:
+            dx = abs(self.loc_player_global[0] - self.loc_watch_dog[0])
+            dy = abs(self.loc_player_global[1] - self.loc_watch_dog[1])
+        except (TypeError, IndexError):
+            return 0.0
+
+        current_time = time.time()
+        if dx + dy > self.cfg["watchdog"]["range"]:
+            self.loc_watch_dog = self.loc_player_global
+            self.t_watch_dog = current_time
+            return 0.0
+
+        # Standing still while actively attacking nearby monsters is normal
+        # for Hybrid AoE farming - treat recent combat as "not stuck".
+        wd = self.cfg.get("watchdog", {}) if isinstance(self.cfg, dict) else {}
+        combat_grace = float(wd.get("combat_grace_sec", 5))
+        if combat_grace > 0:
+            last_combat = max(
+                float(getattr(self, "t_last_attack", 0.0) or 0.0),
+                float(getattr(self, "t_last_aoe_attack", 0.0) or 0.0),
+            )
+            in_engage = False
+            try:
+                in_engage = bool(self.is_engaging())
+            except Exception:
+                in_engage = current_time < float(getattr(self, "engage_until", 0.0) or 0.0)
+            aoe_mobs = int(getattr(self, "hybrid_aoe_monster_count", 0) or 0)
+            if (
+                (current_time - last_combat) <= combat_grace
+                or in_engage
+                or aoe_mobs >= 1
+            ):
+                self.loc_watch_dog = self.loc_player_global
+                self.t_watch_dog = current_time
+                return 0.0
+
+        return current_time - self.t_watch_dog
+
+    def is_player_stuck(self, reset_on_trigger=True):
+        """
+        Checks whether the player is stuck (not moving)
+        based on their global position on map.
+
+        This function:
+        - Compares the player's current position with their last known position
+          tracked by the watchdog.
+        - If the player has moved beyond a threshold (`watch_dog_range`),
+          it resets the watchdog timer.
+        - If the player hasn't moved and the elapsed time exceeds (`watch_dog_timeout`),
+          it flags the player as stuck.
+        - When reset_on_trigger=True (legacy), watchdog is pulse-reset so random
+          recovery fires about once per timeout window (patrol / rune find).
+        - When reset_on_trigger=False, stuck stays True until the player moves
+          (used by continuous recovery tracking).
+
+        Returns:
+            bool: True if the player is stuck, False otherwise.
+        """
+        dt = self.get_immobile_seconds()
+        if dt > self.cfg["watchdog"]["timeout"]:
+            if time.time() - float(getattr(self, "t_last_stuck_log", 0.0)) > 2.0:
+                logger.warning(
+                    f"[is_player_stuck] Player stuck for {round(dt, 2)} seconds."
+                )
+                self.t_last_stuck_log = time.time()
+            if reset_on_trigger:
+                # Legacy pulse: allow another stuck trigger after another timeout
+                self.loc_watch_dog = self.loc_player_global
+                self.t_watch_dog = time.time()
+            return True
+        return False
+
+    def screenshot_img_frame(self):
+        '''
+        Save self.img_frame
+        '''
+        if self.img_frame is None:
+            logger.error("[screenshot_img_frame] Failed, game window is not available")
+        else:
+            screenshot(self.img_frame, "img_frame")
+
+        if self.img_frame_debug is None:
+            pass
+        else:
+            screenshot(self.img_frame_debug, "img_frame_debug")
+
+        if self.frame is None:
+            pass
+        else:
+            screenshot(self.frame, "frame")
+
+    def is_near_edge(self):
+        '''
+        Detects whether the player is near a teleport edge region
+
+        This function:
+        - Defines a rectangular search region around the player's current global location.
+        - Scans for pixels matching a specific edge teleport color code within the region.
+        - If matching pixels are found, it computes the average X position of those pixels.
+        - Compares that average to the player's X position to determine whether the edge is on the left or right.
+
+        Returns:
+            str: One of:
+                - "edge on left"
+                - "edge on right"
+                - "" (empty string if no edge is detected nearby)
+        '''
+        x0, y0 = self.loc_player_global
+        h, w = self.img_route.shape[:2]
+        h_trigger_box = self.cfg["edge_teleport"]["trigger_box_height"]
+        w_trigger_box = self.cfg["edge_teleport"]["trigger_box_width"]
+        x_min = max(0, x0 - w_trigger_box//2)
+        x_max = min(w, x0 + w_trigger_box//2)
+        y_min = max(0, y0 - h_trigger_box//2)
+        y_max = min(h, y0 + h_trigger_box//2)
+
+        # Debug: draw search box
+        # draw_rectangle(
+        #     self.img_route_debug,
+        #     (x_min, y_min),
+        #     (y_max - y_min, x_max - x_min),
+        #     (0, 0, 255), "Edge Check", thickness=1, text_height=0.4
+        # )
+
+        # Find mask of matching pixels
+        roi = self.img_route[y_min:y_max, x_min:x_max]
+        mask = np.all(roi == self.cfg["edge_teleport"]["color_code"], axis=2)
+        coords = np.column_stack(np.where(mask))
+
+        # No edge pixel
+        if coords.size == 0:
+            return ""
+
+        # Calculate mean position of matching pixels
+        mean_x = np.mean(coords[:, 1])
+
+        # Compare to roi center
+        if mean_x < x0:
+            return "edge on left"
+        else:
+            return "edge on right"
+
+    def update_info_on_img_frame_debug(self):
+        '''
+        update_info_on_img_frame_debug
+        '''
+        # Print text at bottom left corner
+        self.fps = round(1.0 / (time.time() - self.t_last_frame))
+        text_y_interval = 23
+        text_y_start = 460
+        dt_screenshot = time.time() - self.kb.t_last_screenshot
+        h, w = self.frame.shape[:2]
+        text_list = [
+            f"FPS: {self.fps}",
+            f"State: {self.fsm.state.name}",
+            f"Resolution: {h}x{w}, Ratio: {round(w/h, 2)}",
+            f"Press 'F1' to {'pause' if self.kb.is_enable else 'start'} Bot",
+            f"Press 'F2' to save screenshot{' : Saved' if dt_screenshot < 0.7 else ''}",
+             "Press 'F12' to quit"]
+        for idx, text in enumerate(text_list):
+            cv2.putText(
+                self.img_frame_debug, text,
+                (10, text_y_start + text_y_interval*idx),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255),
+                2, cv2.LINE_AA
+            )
+
+        # Draw attack box on debug window
+        if self.cfg["bot"]["attack"] == "aoe_skill":
+            x0, y0, x1, y1 = self.get_attack_range()
+            draw_rectangle(
+                self.img_frame_debug, (x0, y0),
+                (y1-y0, x1-x0),
+                (0, 0, 255), "Attack Range"
+            )
+        elif self.cfg["bot"]["attack"] in ("directional", "hybrid"):
+            x0, y0, x1, y1 = self.get_attack_range(is_left=True)
+            draw_rectangle(
+                self.img_frame_debug, (x0, y0),
+                (y1-y0, x1-x0),
+                (0, 0, 255), "Attack Range(Left)"
+            )
+            x0, y0, x1, y1 = self.get_attack_range(is_left=False)
+            draw_rectangle(
+                self.img_frame_debug, (x0, y0),
+                (y1-y0, x1-x0),
+                (0, 0, 255), "Attack Range(Right)"
+            )
+            if self.cfg["bot"]["attack"] == "hybrid":
+                x0, y0, x1, y1 = self.get_aoe_attack_range()
+                threshold = int(self.cfg.get("hybrid_attack", {}).get(
+                    "aoe_trigger_count", 2
+                ))
+                draw_rectangle(
+                    self.img_frame_debug, (x0, y0),
+                    (y1-y0, x1-x0),
+                    (220, 60, 220),
+                    f"Hybrid AOE {self.hybrid_aoe_monster_count}/{threshold}",
+                    thickness=1,
+                    text_height=0.5,
+                )
+
+        # Draw the status-bar matches on the full debug frame.
+        bar_labels = ("HP", "MP", "EXP")
+        bar_values = (
+            self.health_monitor.hp_percent,
+            self.health_monitor.mp_percent,
+            self.health_monitor.exp_percent,
+        )
+        ui_y_start = self.cfg["ui_coords"]["ui_y_start"]
+        for label, value, (x, y, w, h) in zip(
+            bar_labels, bar_values, self.health_monitor.loc_size_bars
+        ):
+            draw_rectangle(
+                self.img_frame_debug,
+                (x, y + ui_y_start),
+                (h, w),
+                (0, 220, 255),
+                f"{label}: {value:.1f}%",
+                thickness=1,
+                text_height=0.45,
+            )
+
+        # Draw minimap rectangle on img debug
+        draw_rectangle(
+            self.img_frame_debug,
+            self.loc_minimap,
+            self.img_minimap.shape[:2],
+            (0, 0, 255), "minimap",thickness=2
+        )
+
+        # Don't draw minimap in patrol mode
+        if self.cfg["bot"]["mode"] in ["patrol", "aux", "smart_patrol"]:
+            return
+
+        # Compute crop region with boundary check
+        crop_w, crop_h = 80, 80
+        x0 = max(0, self.loc_player_global[0] - crop_w // 2)
+        y0 = max(0, self.loc_player_global[1] - crop_h // 2)
+        x1 = min(self.img_route_debug.shape[1], x0 + crop_w)
+        y1 = min(self.img_route_debug.shape[0], y0 + crop_h)
+
+        # Check if valid crop region
+        if x1 <= x0 or y1 <= y0:
+            return
+
+        # Crop region
+        mini_map_crop = self.img_route_debug[y0:y1, x0:x1]
+        mini_map_crop = cv2.resize(mini_map_crop,
+                                (int(mini_map_crop.shape[1] * 2),
+                                 int(mini_map_crop.shape[0] * 2)),
+                                interpolation=cv2.INTER_NEAREST)
+        # Paste into top-right corner of self.img_frame_debug
+        h_crop, w_crop = mini_map_crop.shape[:2]
+        h_frame, w_frame = self.img_frame_debug.shape[:2]
+        x_paste = w_frame - w_crop - 10  # 10px margin from right
+        y_paste = 10
+        self.img_frame_debug[y_paste:y_paste + h_crop, x_paste:x_paste + w_crop] = mini_map_crop
+
+        # Draw border around minimap
+        cv2.rectangle(
+            self.img_frame_debug,
+            (x_paste, y_paste),
+            (x_paste + w_crop, y_paste + h_crop),
+            color=(255, 255, 255),   # White border
+            thickness=2
+        )
+
+        # Draw HP/MP/EXP bar on debug window
+        percent_bars = [self.health_monitor.hp_percent,
+                      self.health_monitor.mp_percent,
+                      self.health_monitor.exp_percent]
+        for i, bar_name in enumerate(["HP", "MP", "EXP"]):
+            x_s, y_s = (250, 30)
+            # Print bar ratio on debug window
+            cv2.putText(self.img_frame_debug,
+                        f"{bar_name}: {percent_bars[i]:.1f}%",
+                        (x_s, y_s + 30*i),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+            # Draw bar on debug window
+            x_s, y_s = (410, 13)
+            x, y, w, h = self.health_monitor.loc_size_bars[i]
+            self.img_frame_debug[y_s+30*i:y_s+h+30*i, x_s:x_s+w] = \
+                self.img_frame[self.cfg["ui_coords"]["ui_y_start"]:, :][y:y+h, x:x+w]
+
+        # Print command on screen
+        cv2.putText(self.img_frame_debug, f"Cmd: {self.cmd_move_x} {self.cmd_move_y} {self.cmd_action}",
+                    (10, 430), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+    def update_img_frame_debug(self):
+        '''
+        update_img_frame_debug
+        '''
+        cv2.imshow("Game Window Debug",
+            self.img_frame_debug[:self.cfg["ui_coords"]["ui_y_start"], :])
+        # Update FPS timer
+        self.t_last_frame = time.time()
+
+    def ensure_is_in_party(self):
+        '''
+        ensure_is_in_party
+        '''
+        if not self.cfg["party_red_bar"].get("enable", False):
+            return
+        if self.img_create_party_enable is None:
+            logger.warning("[ensure_is_in_party] Create-party template is unavailable; skip")
+            return
+
+        # open party window
+        press_key(self.cfg["key"]["party"])
+
+        # Wait party window to show up
+        time.sleep(0.5)
+
+        # Update image frame
+        self.img_frame = self.get_img_frame()
+
+        # Find the 'create party' button
+        loc_enable, score_enable, _ = find_pattern_sqdiff(
+                        self.img_frame, self.img_create_party_enable)
+
+        lang = self.cfg["system"]["language"]
+        thres = self.cfg['party_red_bar'][f'create_party_button_{lang}_thres']
+        if score_enable < thres:
+            logger.info(f"[ensure_is_in_party] Find party enable button({round(score_enable, 2)})")
+            h, w = self.img_create_party_enable.shape[:2]
+            click_in_game_window(self.capture.window_title,
+                (loc_enable[0] + w // 2,
+                 loc_enable[1] + h // 2 + self.cfg['game_window']['title_bar_height'])
+            )
+        else:
+            logger.info("[ensure_is_in_party] Cannot find create party button."
+                        "Maybe player already in party.")
+
+        # close party window
+        press_key(self.cfg["key"]["party"])
+
+    def channel_change(self):
+        '''
+        channel_change
+        '''
+        logger.info("[channel_change] Start")
+
+        if self.img_login_button is None:
+            logger.warning("[channel_change] Login template is unavailable; cancel channel change")
+            return
+
+        window_title = self.capture.window_title
+        ui_coords = self.cfg["ui_coords"]
+        click_in_game_window(window_title, ui_coords["menu"])
+        time.sleep(1)
+        click_in_game_window(window_title, ui_coords["channel"])
+        time.sleep(1)
+        click_in_game_window(window_title, ui_coords["random_channel"])
+        time.sleep(1)
+        click_in_game_window(window_title, ui_coords["random_channel_confirm"])
+        time.sleep(1)
+
+        loc_login_button = None
+        while loc_login_button is None and not self.is_terminated:
+            try:
+                self.img_frame = self.get_img_frame()
+                loc_login_button = self.get_login_button_location()
+                if loc_login_button is None:
+                    logger.info("Waiting for login button to show up...")
+            except Exception as e:
+                logger.warning(f"Exception occurred while waiting for login button: {e}")
+                if not is_mac():
+                    resize_window(window_title, width=1296, height=759)
+                logger.info("Retrying login button detection...")
+
+            time.sleep(3)
+        logger.info(f"login_button button found: {loc_login_button}")
+
+        time.sleep(3)  # wait the screen to be brighter
+
+        # Click login button
+        click_in_game_window(window_title, loc_login_button)
+        time.sleep(2)
+
+        # Click "Select Character"
+        click_in_game_window(window_title, ui_coords["select_character"])
+        time.sleep(5)
+
+        self.kb.enable()
+        self.kb.set_command("none none none")
+        self.kb.release_all_key()
+
+        if self.cfg["party_red_bar"].get("enable", False):
+            self.ensure_is_in_party() # Make sure player is in party
+
+        self.fsm.set_init_state("hunting")
+        self.t_last_attack = time.time() # Update timer
+
+    def terminate_threads(self):
+        '''
+        terminate all threads
+        '''
+        # Terminate keyboard controller
+        if self.kb is not None:
+            self.kb.is_terminated = True
+        # Terminate game window capturor
+        if self.capture is not None:
+            self.capture.stop()
+        # Terminate health monitor
+        if self.health_monitor is not None:
+            self.health_monitor.stop()
+        self.is_terminated = True
+        logger.info(f"[terminate_threads] Terminated all threads")
+
+    def get_attack_direction(self, monster_left, monster_right):
+        '''
+        Choose left/right attack side from nearest monsters in each attack box.
+
+        When both sides have valid targets, always pick a side (sticky engage_side
+        if set, else nearer). Never return None solely because distances are close —
+        that used to fall through to route and cause left/right thrashing in crowds.
+        '''
+        # Compute distance for left
+        distance_left = float('inf')
+        if monster_left is not None:
+            mx, my = monster_left["position"]
+            mw, mh = monster_left["size"]
+            center_left = (mx + mw // 2, my + mh // 2)
+            distance_left = abs(center_left[0] - self.loc_player[0]) + \
+                            abs(center_left[1] - self.loc_player[1])
+        # Compute distance for right
+        distance_right = float('inf')
+        if monster_right is not None:
+            mx, my = monster_right["position"]
+            mw, mh = monster_right["size"]
+            center_right = (mx + mw // 2, my + mh // 2)
+            distance_right = abs(center_right[0] - self.loc_player[0]) + \
+                            abs(center_right[1] - self.loc_player[1])
+        attack_direction = None
+
+        def is_monster_on_correct_side(monster, direction):
+            if monster is None:
+                return False
+            mx, my = monster["position"]
+            mw, mh = monster["size"]
+            monster_center_x = mx + mw // 2
+            player_x = self.loc_player[0]
+
+            if direction == "left":
+                return monster_center_x < player_x  # Monster should be left of player
+            else:  # direction == "right"
+                return monster_center_x > player_x  # Monster should be right of player
+
+        if monster_left is not None and monster_right is None and \
+            is_monster_on_correct_side(monster_left, "left"):
+            attack_direction = "left"
+        elif monster_right is not None and monster_left is None and \
+            is_monster_on_correct_side(monster_right, "right"):
+            attack_direction = "right"
+        elif monster_left is not None and monster_right is not None:
+            # Both sides have monsters — pick sticky side or nearer; never None
+            left_valid = is_monster_on_correct_side(monster_left, "left")
+            right_valid = is_monster_on_correct_side(monster_right, "right")
+
+            if left_valid and not right_valid:
+                attack_direction = "left"
+            elif right_valid and not left_valid:
+                attack_direction = "right"
+            elif left_valid and right_valid:
+                sticky_side = getattr(self, "engage_side", None)
+                if (self._engage_side_sticky()
+                        and sticky_side in ("left", "right")):
+                    attack_direction = sticky_side
+                elif distance_left <= distance_right:
+                    attack_direction = "left"
+                else:
+                    attack_direction = "right"
+            elif left_valid:
+                attack_direction = "left"
+            elif right_valid:
+                attack_direction = "right"
+
+        # Debug attack direction selection
+        if monster_left is not None or monster_right is not None:
+            left_side_ok = is_monster_on_correct_side(monster_left, "left") if monster_left else False
+            right_side_ok = is_monster_on_correct_side(monster_right, "right") if monster_right else False
+            debug_text = f"L:{distance_left:.0f}({left_side_ok}) R:{distance_right:.0f}({right_side_ok}) Dir:{attack_direction}"
+            if self.img_frame_debug is not None:
+                cv2.putText(self.img_frame_debug, debug_text,
+                            (10, 450), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+        return attack_direction
+
+    def is_need_change_channel(self, loc_other_players):
+        '''
+        is_need_change_channel
+        '''
+        # Calculate center value
+        xs = [x for (x, _) in loc_other_players]
+        ys = [y for (_, y) in loc_other_players]
+        if len(xs) == 0 or len(ys) == 0:
+            return False
+        center_x, center_y = (np.mean(xs), np.mean(ys))
+        if np.isnan(center_x) or np.isnan(center_y):
+            return False
+        center = (int(np.mean(xs)), int(np.mean(ys)))
+        #logger.info(f"[is_need_change_channel] Center of mass = {center}")
+
+        # Change channel
+        mode = self.cfg["channel_change"]["mode"]
+        if mode == "true":
+            logger.warning("[is_need_change_channel] Player detected, immediately change channel.")
+            return True
+        elif mode == "pixel":
+            if self.red_dot_center_prev is None:
+                self.red_dot_center_prev = center
+            else:
+                dx = abs(center[0] - self.red_dot_center_prev[0])
+                dy = abs(center[1] - self.red_dot_center_prev[1])
+                total = dx + dy
+                logger.debug(f"[is_need_change_channel] Movement dx={dx}, dy={dy}, total={total}")
+                thres = self.cfg["channel_change"]["other_player_move_thres"]
+                if total > thres:
+                    logger.warning(f"Other player movement > {thres} pixel detected. "
+                                "Trigger channel change.")
+                    return True
+        else:
+            logger.error(f"[is_need_change_channel] Unsupported mode: {mode}")
+
+        return False
+
+    def is_time_to_change_channel(self):
+        '''
+        is_time_to_change_channel
+        '''
+        if not self.cfg["scheduled_channel_switching"]["enable"]:
+            return False
+        dt = time.time() - self.t_to_change_channel
+        if dt > self.cfg["scheduled_channel_switching"]["interval_seconds"]:
+            self.t_to_change_channel = time.time()
+            return True
+        return False
+
+    def get_login_button_location(self):
+        '''
+        get_login_button_location
+        '''
+        if self.img_login_button is None:
+            return None
+
+        # Extract the region where the login button should appear
+        x0, y0 = self.cfg["ui_coords"]["login_button_top_left"]
+        x1, y1 = self.cfg["ui_coords"]["login_button_bottom_right"]
+        img_roi = self.img_frame[y0:y1, x0:x1]
+
+        # Draw rectange on debug image
+        if self.img_frame_debug is not None:
+            draw_rectangle(self.img_frame_debug, (x0, y0),
+                           (y1-y0, x1-x0), (0, 255, 0), "login_button box")
+
+        # Find the 'login' button
+        loc, score, _ = find_pattern_sqdiff(
+                        img_roi, self.img_login_button)
+        if score < self.cfg["ui_coords"]["login_button_thres"]:
+            h, w = self.img_login_button.shape[:2]
+            logger.info(f"[get_login_button_location] Found login button with score({score})")
+            return (x0 + loc[0] + w // 2,
+                    y0 + loc[1] + h // 2 + self.cfg['game_window']['title_bar_height'])
+        else:
+            return None
+
+    def update_cmd_by_route(self):
+        # get color code from img_route
+        color_code, color_code_up_down = self.get_nearest_color_code()
+        # Use color_code and color_code_up_down to complement each other
+        # To prevent character stuck at the end of ladder, we use two color color pixels
+        # and let them complement with each other, to ensure smoothy ladder climbing
+        if color_code and color_code_up_down:
+            if color_code["distance"] < color_code_up_down["distance"]:
+                self.cmd_move_x, self.cmd_move_y, self.cmd_action = color_code["command"].split()
+                _, cmd, _ = color_code_up_down["command"].split()
+                if self.cmd_move_y == "none" and self.is_on_ladder:
+                    self.cmd_move_y = cmd # only complement cmd_move_y when player is on ladder
+            else:
+                self.cmd_move_x, self.cmd_move_y, self.cmd_action = color_code_up_down["command"].split()
+                cmd, _, _ = color_code["command"].split()
+                if self.cmd_move_x == "none" and self.is_on_ladder:
+                    self.cmd_move_x = cmd # only complement cmd_move_x when player is on ladder
+        elif color_code:
+            self.cmd_move_x, self.cmd_move_y, self.cmd_action = color_code["command"].split()
+        elif color_code_up_down:
+            self.cmd_move_x, self.cmd_move_y, self.cmd_action = color_code_up_down["command"].split()
+
+        # teleport away from edge to avoid falling off cliff
+        if self.is_near_edge() and \
+            time.time() - self.t_last_teleport > self.cfg["teleport"]["cooldown"]:
+            self.cmd_action = "teleport"
+            self.t_last_teleport = time.time() # update timer
+
+        # Use teleport while walking
+        if self.cfg['teleport']['is_use_teleport_to_walk'] and \
+            time.time() - self.t_last_teleport > self.cfg['teleport']['cooldown']:
+            self.cmd_action = "teleport"
+            self.t_last_teleport = time.time() # update timer
+
+        # replace teleport to jump if user doesn't set teleport key
+        if self.cfg["key"]["teleport"] == "" and self.cmd_action == "teleport":
+            self.cmd_action = "jump"
+
+    def _mob_detection_parameters(self):
+        """Return the nearby scan radius and attack cooldown for this attack type."""
+        margin = self.cfg["monster_detect"]["search_box_margin"]
+        attack_mode = self.cfg["bot"]["attack"]
+        if attack_mode == "aoe_skill":
+            dx = self.cfg["aoe_skill"]["range_x"] // 2 + margin
+            dy = self.cfg["aoe_skill"]["range_y"] // 2 + margin
+            cooldown = self.cfg["aoe_skill"]["cooldown"]
+        elif attack_mode == "directional":
+            dx = self.cfg["directional_attack"]["range_x"] + margin
+            dy = self.cfg["directional_attack"]["range_y"] + margin
+            cooldown = self.cfg["directional_attack"]["cooldown"]
+        elif attack_mode == "hybrid":
+            dx = max(
+                self.cfg["directional_attack"]["range_x"],
+                self.cfg["aoe_skill"]["range_x"] // 2,
+            ) + margin
+            dy = max(
+                self.cfg["directional_attack"]["range_y"],
+                self.cfg["aoe_skill"]["range_y"] // 2,
+            ) + margin
+            cooldown = self.cfg["directional_attack"]["cooldown"]
+        else:
+            raise RuntimeError(f"Unsupported attack mode: {self.cfg['bot']['attack']}")
+
+        return dx, dy, cooldown
+
+    def detect_monsters_near_player(self):
+        """Update the blue-box nearby-monster result without issuing an attack."""
+        if not self._should_run_monster_detect():
+            return self.monsters
+        dx, dy, _cooldown = self._mob_detection_parameters()
+        x0 = max(0                      , self.loc_player[0] - dx)
+        x1 = min(self.img_frame.shape[1], self.loc_player[0] + dx)
+        y0 = max(0                      , self.loc_player[1] - dy)
+        y1 = min(self.img_frame.shape[0], self.loc_player[1] + dy)
+
+        live = self.get_monsters_in_range((x0, y0), (x1, y1))
+        self._update_monster_tracks(live)
+        # Hybrid AoE must count live detections only (never soft/ghosts).
+        self.hybrid_aoe_monster_count = (
+            self.count_monsters_in_aoe_range()
+            if self.cfg["bot"]["attack"] == "hybrid" else 0
+        )
+        self._draw_soft_monster_tracks()
+        return self.monsters
+
+    def _monster_track_enabled(self):
+        raw = self._engage_cfg_value("monster_track_enable", False)
+        if isinstance(raw, str):
+            return raw.strip().lower() in ("1", "true", "yes", "on")
+        return bool(raw)
+
+    def _monster_track_ttl_sec(self):
+        raw = self._engage_cfg_value("monster_track_ttl_sec", 0.4)
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 0.4
+
+    def _monster_track_match_dist(self):
+        raw = self._engage_cfg_value("monster_track_match_dist", 80)
+        try:
+            return max(1.0, float(raw))
+        except (TypeError, ValueError):
+            return 80.0
+
+    def _monster_track_soft_when_live_max(self):
+        """If live count > this, ignore soft/ghosts for decision_monsters."""
+        raw = self._engage_cfg_value("monster_track_soft_when_live_max", 1)
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 1
+
+    def _engage_side_sticky(self):
+        """Keep engage_side until miss grace / no targets on that side."""
+        raw = self._engage_cfg_value("engage_side_sticky", True)
+        if isinstance(raw, str):
+            return raw.strip().lower() in ("1", "true", "yes", "on")
+        return bool(raw)
+
+    def _pick_nearer_attack_side(self, monster_left, monster_right):
+        """Pick nearer of left/right attack-range monsters; None if both empty."""
+        def _dist(monster):
+            if monster is None:
+                return float("inf")
+            mx, my = monster["position"]
+            mw, mh = monster["size"]
+            return abs(mx + mw // 2 - self.loc_player[0]) + \
+                   abs(my + mh // 2 - self.loc_player[1])
+        if monster_left is None and monster_right is None:
+            return None
+        if monster_left is not None and monster_right is None:
+            return "left"
+        if monster_right is not None and monster_left is None:
+            return "right"
+        return "left" if _dist(monster_left) <= _dist(monster_right) else "right"
+
+    def _update_monster_tracks(self, live_detections, now=None):
+        """Associate live detections into tracks; fill soft/decision lists."""
+        now = time.time() if now is None else now
+        if not hasattr(self, "monster_tracker") or self.monster_tracker is None:
+            self.monster_tracker = MonsterTracker()
+        if not self._monster_track_enabled():
+            self.monster_tracker.clear()
+            self.monsters = list(live_detections or [])
+            self.soft_monsters = []
+            self.decision_monsters = list(self.monsters)
+            return self.decision_monsters
+
+        live, soft = self.monster_tracker.update(
+            live_detections or [],
+            now=now,
+            ttl_sec=self._monster_track_ttl_sec(),
+            match_dist=self._monster_track_match_dist(),
+        )
+        self.monsters = live
+        self.soft_monsters = soft
+        # Soft fills gaps when live is empty/sparse; when crowded, live-only
+        # for directional choice so ghosts behind the player cannot thrash side.
+        soft_when_live_max = self._monster_track_soft_when_live_max()
+        if len(live) > soft_when_live_max:
+            self.decision_monsters = list(live)
+        else:
+            self.decision_monsters = list(live) + list(soft)
+        return self.decision_monsters
+
+    def has_soft_combat_target(self):
+        """True when a soft/ghost track is still within TTL (alias: has_soft_target)."""
+        return bool(getattr(self, "soft_monsters", None))
+
+    def has_soft_target(self):
+        return self.has_soft_combat_target()
+
+    def _draw_soft_monster_tracks(self):
+        """Optional debug overlay: draw ghost tracks differently from live boxes."""
+        img = getattr(self, "img_frame_debug", None)
+        soft = getattr(self, "soft_monsters", None) or []
+        if img is None or not soft:
+            return
+        for monster in soft:
+            tid = monster.get("track_id", "?")
+            draw_rectangle(
+                img,
+                monster["position"],
+                (monster["size"][1], monster["size"][0]),
+                (0, 165, 255),  # orange (BGR)
+                f"soft#{tid}",
+            )
+
+    def _hybrid_aoe_cooldown(self):
+        """Honor UI/config AoE cooldown; only clamp zero/negative values."""
+        hybrid_cfg = self.cfg.get("hybrid_attack", {}) if isinstance(self.cfg, dict) else {}
+        try:
+            return max(0.25, float(hybrid_cfg.get("aoe_cooldown", 0.9)))
+        except (TypeError, ValueError):
+            return 0.9
+
+    def _engage_cfg_value(self, key, default):
+        """Read engage timing: combat > hybrid_attack > bot."""
+        for section in ("combat", "hybrid_attack", "bot"):
+            block = self.cfg.get(section, {})
+            if isinstance(block, dict) and key in block:
+                return block[key]
+        return default
+
+    def _engage_hold_sec(self):
+        raw = self._engage_cfg_value("engage_hold_sec", 1.2)
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 1.2
+
+    def _engage_miss_grace_sec(self):
+        """Single miss grace while engaging with empty targets (stand+pulse)."""
+        raw = self._engage_cfg_value("engage_miss_grace_sec", None)
+        if raw is None:
+            kill = self._engage_cfg_value("engage_miss_grace_kill_sec", None)
+            flicker = self._engage_cfg_value("engage_miss_grace_flicker_sec", None)
+            if kill is not None and flicker is not None:
+                try:
+                    if abs(float(kill) - float(flicker)) < 1e-9:
+                        raw = kill
+                except (TypeError, ValueError):
+                    pass
+            if raw is None:
+                raw = flicker if flicker is not None else kill
+            if raw is None:
+                raw = 0.35
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 0.35
+
+    def _engage_miss_grace_kill_sec(self):
+        """Alias for single-tier miss grace (backward compatible)."""
+        return self._engage_miss_grace_sec()
+
+    def _engage_miss_grace_flicker_sec(self):
+        """Alias for single-tier miss grace (backward compatible)."""
+        return self._engage_miss_grace_sec()
+
+    def is_engaging(self):
+        """True while finish-kill engage-hold is active."""
+        return time.time() < float(getattr(self, "engage_until", 0.0))
+
+    def clear_engage(self):
+        self.engage_until = 0.0
+        self.engage_side = None
+        self.engage_miss_since = 0.0
+
+    def _set_engage(self, side, hold_sec=None, now=None):
+        """Remember engage side and extend finish-kill hold window."""
+        now = time.time() if now is None else now
+        if hold_sec is None:
+            hold_sec = self._engage_hold_sec()
+        if side in ("left", "right"):
+            self.engage_side = side
+        self.engage_until = now + float(hold_sec)
+        self.engage_miss_since = 0.0
+
+
+    def _hit_react_enabled(self):
+        raw = self._engage_cfg_value("hit_react_enable", False)
+        if isinstance(raw, str):
+            return raw.strip().lower() in ("1", "true", "yes", "on")
+        return bool(raw)
+
+    def _hit_react_min_drop_percent(self):
+        raw = self._engage_cfg_value("hit_react_min_drop_percent", 4.0)
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 4.0
+
+    def _hit_react_duration_sec(self):
+        raw = self._engage_cfg_value("hit_react_duration_sec", 0.4)
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 0.4
+
+    def _hit_react_cooldown_sec(self):
+        raw = self._engage_cfg_value("hit_react_cooldown_sec", 1.3)
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 1.3
+
+    def _hit_react_jump(self):
+        raw = self._engage_cfg_value("hit_react_jump", True)
+        if isinstance(raw, str):
+            return raw.strip().lower() in ("1", "true", "yes", "on")
+        return bool(raw)
+
+    def _nearest_threat_side(self):
+        """Nearest live (else decision) monster side relative to player."""
+        live = getattr(self, "monsters", None) or []
+        decision = getattr(self, "decision_monsters", None) or []
+        pool = live if live else decision
+        if not pool:
+            return None
+        px, py = self.loc_player
+        best_side = None
+        best_dist = float("inf")
+        for monster in pool:
+            mx, my = monster["position"]
+            mw, mh = monster["size"]
+            cx = mx + mw // 2
+            cy = my + mh // 2
+            dist = abs(cx - px) + abs(cy - py)
+            if dist < best_dist:
+                best_dist = dist
+                best_side = "left" if cx < px else "right"
+        return best_side
+
+    def _pick_hit_react_retreat_dir(self):
+        """Retreat opposite threat: engage_side > nearest monster > facing."""
+        side = getattr(self, "engage_side", None)
+        if side in ("left", "right"):
+            return "right" if side == "left" else "left"
+        threat = self._nearest_threat_side()
+        if threat in ("left", "right"):
+            return "right" if threat == "left" else "left"
+        facing = getattr(getattr(self, "kb", None), "facing_direction", None)
+        if facing in ("left", "right"):
+            return "right" if facing == "left" else "left"
+        return "left"
+
+    def is_hit_reacting(self):
+        """True while HIT_REACT retreat window is active."""
+        return time.time() < float(getattr(self, "hit_react_until", 0.0))
+
+    def update_hit_react_from_hp(self):
+        """Read health_monitor.hp_percent; arm HIT_REACT on sharp drop."""
+        hm = getattr(self, "health_monitor", None)
+        if hm is None:
+            return
+        try:
+            hp = hm.hp_percent
+        except Exception:
+            return
+        if hp is None:
+            return
+
+        prev = getattr(self, "prev_hp_percent", None)
+        now = time.time()
+        if self._hit_react_enabled() and prev is not None:
+            try:
+                drop = float(prev) - float(hp)
+            except (TypeError, ValueError):
+                drop = 0.0
+            min_drop = self._hit_react_min_drop_percent()
+            cd = self._hit_react_cooldown_sec()
+            active = now < float(getattr(self, "hit_react_until", 0.0))
+            cooled = (
+                now - float(getattr(self, "t_last_hit_react", 0.0)) >= cd
+            )
+            if drop >= min_drop and (not active) and cooled:
+                retreat = self._pick_hit_react_retreat_dir()
+                jump = self._hit_react_jump()
+                self.hit_react_dir = retreat
+                self.hit_react_need_jump = jump
+                self.hit_react_until = now + self._hit_react_duration_sec()
+                self.t_last_hit_react = now
+                logger.info(
+                    f"[HitReact] HP drop {drop:.1f}% -> retreat {retreat} "
+                    f"jump={jump}"
+                )
+
+        self.prev_hp_percent = float(hp)
+
+    def apply_hit_react_cmd(self):
+        """Move away from threat; optional one-shot jump; pause attack."""
+        direction = getattr(self, "hit_react_dir", None)
+        if direction not in ("left", "right"):
+            direction = self._pick_hit_react_retreat_dir()
+            self.hit_react_dir = direction
+        self.cmd_move_x = direction if direction in ("left", "right") else "none"
+        self.cmd_move_y = "none"
+        if getattr(self, "hit_react_need_jump", False):
+            self.cmd_action = "jump"
+            self.hit_react_need_jump = False
+        else:
+            self.cmd_action = "none"
+
+    def handle_hit_react_frame(self):
+        """
+        HuntingState entry: if HIT_REACT active, keep monster tracks warm,
+        apply retreat (no attack), send KB command, return True to skip route/mob.
+        """
+        if not self.is_hit_reacting():
+            return False
+        # Keep soft/live tracks alive without combat command overwrite
+        try:
+            if getattr(self, "img_frame", None) is not None:
+                self.detect_monsters_near_player()
+        except Exception as e:
+            logger.debug(f"[HitReact] track refresh skipped: {e}")
+        self.apply_hit_react_cmd()
+        if getattr(self, "kb", None) is not None:
+            self.kb.set_command(
+                self.cmd_move_x + ' ' + self.cmd_move_y + ' ' + self.cmd_action
+            )
+        return True
+
+    def update_cmd_by_mob_detection(self, use_cached=False):
+        """Detect nearby monsters and update the combat command."""
+        attack_mode = self.cfg["bot"]["attack"]
+        _dx, _dy, cooldown = self._mob_detection_parameters()
+        if not use_cached:
+            self.detect_monsters_near_player()
+
+        now = time.time()
+
+        # Decision targets = live U soft(within TTL). Soft holds side through flicker;
+        # hybrid AoE still uses live-only hybrid_aoe_monster_count.
+        decision = getattr(self, "decision_monsters", None)
+        if decision is None:
+            decision = self.monsters
+        # Check if no mob to attack (live and soft both empty / expired)
+        if len(decision) == 0:
+            # Single miss grace while engaging: stand + pulse for grace_sec, then clear.
+            if (now < float(getattr(self, "engage_until", 0.0))
+                    and getattr(self, "engage_side", None) in ("left", "right")):
+                if float(getattr(self, "engage_miss_since", 0.0)) <= 0.0:
+                    self.engage_miss_since = now
+                    logger.debug("[Engage] Miss start: single grace (stand+pulse)")
+                grace = self._engage_miss_grace_sec()
+                if now - self.engage_miss_since > grace:
+                    self.clear_engage()
+                    self._reset_directional_attack_turn()
+                    # Hunting skipped route because is_engaging was True at
+                    # frame start — restore route now to avoid one-frame vacuum.
+                    # smart_patrol has no route PNGs; leave cmd for its Scan phase.
+                    if self.cfg.get("bot", {}).get("mode") == "normal" and self.img_routes:
+                        self.update_cmd_by_route()
+                        self.check_reach_goal()
+                        logger.debug(
+                            f"[Engage] Miss grace expired ({grace:.2f}s); resume route."
+                        )
+                    else:
+                        logger.debug(
+                            f"[Engage] Miss grace expired ({grace:.2f}s); "
+                            "no route resume (non-normal mode)."
+                        )
+                    return
+                self.cmd_move_x = "none"
+                self.cmd_move_y = "none"
+                self.cmd_action = "none"
+                self._pulse_direction_then_attack(
+                    self.engage_side, cooldown, now=now
+                )
+                return
+            if now >= float(getattr(self, "engage_until", 0.0)):
+                self.clear_engage()
+            self._reset_directional_attack_turn()
+            return
+
+        # Monsters present again
+        self.t_last_monster_seen = now
+        self.engage_miss_since = 0.0
+
+        # Update attack command
+        if attack_mode == "aoe_skill":
+            # Pure AoE: require live detection (soft/ghost alone is not enough)
+            if len(self.monsters) > 0 and now - self.t_last_attack > cooldown:
+                self.cmd_action = "attack"
+                self.t_last_attack = now
+                self._set_engage(getattr(self, "engage_side", None) or "left", now=now)
+
+        elif attack_mode in ("directional", "hybrid"):
+            if attack_mode == "hybrid":
+                hybrid_cfg = self.cfg.get("hybrid_attack", {})
+                trigger_count = max(2, int(hybrid_cfg.get(
+                    "aoe_trigger_count", 2
+                )))
+                aoe_cooldown = self._hybrid_aoe_cooldown()
+                aoe_key = self.cfg.get("key", {}).get("aoe_skill", "")
+                next_aoe = float(getattr(self, "t_next_aoe_attack", 0.0) or 0.0)
+                if (self.hybrid_aoe_monster_count >= trigger_count
+                        and aoe_key and now >= next_aoe):
+                    self._reset_directional_attack_turn()
+                    self.cmd_move_x = "none"
+                    self.cmd_move_y = "none"
+                    self.cmd_action = "aoe_attack"
+                    self.t_last_aoe_attack = now
+                    # Jitter next arm so dense packs do not press at a fixed Hz.
+                    self.t_next_aoe_attack = now + aoe_cooldown * random.uniform(0.9, 1.1)
+                    self.t_last_attack = now
+                    # Hold position after AoE so route does not walk away mid-pack
+                    side = getattr(self, "engage_side", None)
+                    if side not in ("left", "right"):
+                        side = "left"
+                    self._set_engage(side, now=now)
+                    logger.info(
+                        "[Hybrid Attack] "
+                        f"{self.hybrid_aoe_monster_count} monsters in AoE range; "
+                        f"press '{aoe_key}'."
+                    )
+                    return
+            # Get nearest monster to player (uses decision_monsters: live±soft)
+            monster_left  = self.get_nearest_monster(is_left = True)
+            monster_right = self.get_nearest_monster(is_left = False)
+
+            # Sticky engage_side: prefer current side while it still has a target
+            attack_direction = None
+            sticky_side = getattr(self, "engage_side", None)
+            if (self._engage_side_sticky()
+                    and sticky_side in ("left", "right")):
+                preferred = monster_left if sticky_side == "left" else monster_right
+                if preferred is not None:
+                    attack_direction = sticky_side
+
+            if attack_direction is None:
+                attack_direction = self.get_attack_direction(
+                    monster_left, monster_right
+                )
+
+            if attack_direction is None:
+                # Targets in attack range → never give route control.
+                # Pick nearer side immediately and engage.
+                if monster_left is not None or monster_right is not None:
+                    attack_direction = self._pick_nearer_attack_side(
+                        monster_left, monster_right
+                    )
+                else:
+                    # Decision list may be non-empty but nothing in attack boxes
+                    self._reset_directional_attack_turn()
+                    return
+
+            # Successful directional/hybrid attack decision -> engage-hold
+            self._set_engage(attack_direction, now=now)
+
+            # Route movement is generated earlier in this frame. Replace it
+            # with a direction-only pulse, wait until the keyboard thread has
+            # actually delivered that pulse, release movement, then attack.
+            self.cmd_move_x = "none"
+            self.cmd_move_y = "none"
+            self.cmd_action = "none"
+            self._pulse_direction_then_attack(attack_direction, cooldown, now=now)
+
+    def _reset_directional_attack_turn(self):
+        self.combat_turn_ready_at = 0.0
+        self.combat_turn_pending_direction = None
+        self.combat_turn_requested_at = 0.0
+
+    def _pulse_direction_then_attack(self, attack_direction, cooldown, now=None):
+        """Guarantee a delivered direction pulse before a directional attack."""
+        now = time.time() if now is None else now
+        if now - self.t_last_attack <= max(0.0, float(cooldown)):
+            return False
+
+        turn_delay = max(0.0, float(
+            self.cfg["directional_attack"].get("character_turn_delay", 0.06)
+        ))
+        skip_if_facing = self.cfg["directional_attack"].get(
+            "skip_turn_if_facing", False
+        )
+        if isinstance(skip_if_facing, str):
+            skip_if_facing = skip_if_facing.strip().lower() in (
+                "1", "true", "yes", "on"
+            )
+        kb = getattr(self, "kb", None)
+        if skip_if_facing and getattr(kb, "facing_direction", None) == attack_direction:
+            # Already facing target: deliver attack without turn pulse wait.
+            if now - self.t_last_attack <= max(0.0, float(cooldown)):
+                return False
+            self.cmd_move_x = "none"
+            self.cmd_action = "attack"
+            self.t_last_attack = now
+            self._reset_directional_attack_turn()
+            self._set_engage(attack_direction, now=now)
+            return True
+        pending_direction = getattr(
+            self, "combat_turn_pending_direction", None
+        )
+        if pending_direction != attack_direction:
+            self.combat_turn_pending_direction = attack_direction
+            self.combat_turn_requested_at = now
+            self.combat_turn_ready_at = now + turn_delay
+            self.cmd_move_x = attack_direction
+            logger.debug(
+                f"[Directional Attack] Turn pulse requested: {attack_direction}"
+            )
+            return False
+
+        kb = getattr(self, "kb", None)
+        requested_at = float(getattr(self, "combat_turn_requested_at", 0.0))
+        delivered_at = getattr(kb, "t_last_direction_input", None)
+        if delivered_at is None:
+            direction_delivered = (
+                getattr(kb, "facing_direction", None) == attack_direction
+            )
+        else:
+            direction_delivered = float(delivered_at) >= requested_at > 0.0
+        if not direction_delivered:
+            self.cmd_move_x = attack_direction
+            return False
+        if now < float(getattr(self, "combat_turn_ready_at", 0.0)):
+            return False
+
+        self.cmd_move_x = "none"
+        self.cmd_action = "attack"
+        self.t_last_attack = now
+        self._reset_directional_attack_turn()
+        # Refresh engage window on each delivered attack
+        self._set_engage(attack_direction, now=now)
+        logger.debug(
+            f"[Directional Attack] Facing {attack_direction}; attack delivered."
+        )
+        return True
+
+
+    def _recovery_cfg(self):
+        """Return recovery config dict with safe defaults."""
+        return self.cfg.get("recovery", {}) if isinstance(self.cfg, dict) else {}
+
+    def _recovery_enabled(self):
+        raw = self._recovery_cfg().get("enable", True)
+        if isinstance(raw, str):
+            return raw.strip().lower() in ("1", "true", "yes", "on")
+        return bool(raw)
+
+    def _clear_recovery(self, log=False):
+        if self.recovery_since is not None and log:
+            elapsed = time.time() - float(self.recovery_since)
+            logger.info(
+                f"[Recovery] Recovered after {elapsed:.1f}s; resume normal hunting"
+            )
+        self.recovery_since = None
+        self.recovery_clear_since = None
+
+    def halt_for_recovery(self, reason):
+        """Disable keyboard and terminate the bot after failed recovery."""
+        logger.warning(f"[Recovery] Halt: {reason}; stop bot")
+        try:
+            if getattr(self, "kb", None) is not None:
+                self.kb.set_command("none none none")
+                self.kb.release_all_key()
+                self.kb.disable()
+                self.kb.is_terminated = True
+        except Exception as e:
+            logger.error(f"[Recovery] Halt keyboard cleanup failed: {e}")
+        self.is_terminated = True
+        self._clear_recovery(log=False)
+
+    def handle_recovery_frame(self):
+        """
+        Stuck / off-route / minimap-lost recovery.
+
+        Returns True if this frame was fully handled as recovery (caller should
+        send the kb command and skip normal combat). Returns False when not
+        in recovery so normal on-route hybrid farming continues.
+        """
+        if not self._recovery_enabled():
+            self._clear_recovery(log=False)
+            return False
+
+        cfg = self._recovery_cfg()
+        now = time.time()
+        watchdog_timeout = float(self.cfg.get("watchdog", {}).get("timeout", 10))
+        immobile = self.get_immobile_seconds()
+        stuck = immobile >= watchdog_timeout
+
+        minimap_lost = False
+        if not getattr(self, "is_player_minimap_detected", True):
+            if self.t_minimap_lost_since is None:
+                self.t_minimap_lost_since = now
+            lost_for = now - float(self.t_minimap_lost_since)
+            if lost_for >= float(cfg.get("minimap_lost_sec", 3)):
+                minimap_lost = True
+        else:
+            self.t_minimap_lost_since = None
+
+        min_duration = float(cfg.get("min_duration_sec", 6))
+        clear_grace = float(cfg.get("clear_stuck_grace_sec", 3))
+
+        if not (stuck or minimap_lost):
+            # Still in an active recovery window: require min pause + sustained free.
+            if self.recovery_since is None:
+                return False
+            if self.recovery_clear_since is None:
+                self.recovery_clear_since = now
+            elapsed = now - float(self.recovery_since)
+            free_for = now - float(self.recovery_clear_since)
+            if elapsed >= min_duration and free_for >= clear_grace:
+                self._clear_recovery(log=True)
+                return False
+            # Stay in recovery (pause attacks) until both conditions are met.
+        else:
+            # Currently stuck / minimap-lost: reset continuous free timer.
+            self.recovery_clear_since = None
+
+        if self.recovery_since is None:
+            self.recovery_since = now
+            self.recovery_clear_since = None
+            logger.warning(
+                "[Recovery] Enter: "
+                f"stuck={stuck} immobile={immobile:.1f}s "
+                f"minimap_lost={minimap_lost}"
+            )
+            # Drop engage-hold so recovery is not overwritten by combat next frame
+            try:
+                self.clear_engage()
+                self._reset_directional_attack_turn()
+            except Exception:
+                pass
+
+        elapsed = now - float(self.recovery_since)
+        halt_after = float(cfg.get("halt_after_sec", 45))
+        if elapsed >= halt_after:
+            self.halt_for_recovery(
+                f"stuck/off-route too long ({elapsed:.1f}s >= {halt_after}s)"
+            )
+            self.cmd_move_x = "none"
+            self.cmd_move_y = "none"
+            self.cmd_action = "none"
+            return True
+
+        prefer_route = cfg.get("prefer_route", True)
+        if isinstance(prefer_route, str):
+            prefer_route = prefer_route.strip().lower() in ("1", "true", "yes", "on")
+
+        route_has_move = False
+        if prefer_route:
+            try:
+                self.update_cmd_by_route()
+                self.check_reach_goal()
+            except Exception as e:
+                logger.debug(f"[Recovery] update_cmd_by_route failed: {e}")
+            # Never keep attack commands from any path while recovering
+            if self.cmd_action in ("attack", "aoe_attack"):
+                self.cmd_action = "none"
+            # Treat "goal" as progress (route switch), not as idle
+            if self.cmd_move_x in ("left", "right") or self.cmd_move_y in ("up", "down"):
+                route_has_move = True
+            elif self.cmd_action in ("jump", "teleport", "goal"):
+                route_has_move = True
+
+        random_after = float(cfg.get("random_after_sec", 8))
+        allow_jump = cfg.get("random_allow_jump", False)
+        if isinstance(allow_jump, str):
+            allow_jump = allow_jump.strip().lower() in ("1", "true", "yes", "on")
+        reissue = float(cfg.get("random_reissue_sec", 1.5))
+
+        # After random_after_sec still recovering: periodically soft-random.
+        # Route is tried every frame first; random only overwrites on reissue beats
+        # so ineffective route color codes do not block unstuck forever.
+        if elapsed >= random_after:
+            if now - float(getattr(self, "t_last_recovery_random", 0.0)) >= reissue:
+                self.update_cmd_by_random(allow_jump=bool(allow_jump))
+                self.t_last_recovery_random = now
+        elif not route_has_move and prefer_route:
+            # Waiting for random_after: hold still / last route cmd, no jump spam
+            if self.cmd_action in ("attack", "aoe_attack", "jump"):
+                self.cmd_action = "none"
+
+        pause_attack = cfg.get("pause_attack", True)
+        if isinstance(pause_attack, str):
+            pause_attack = pause_attack.strip().lower() in ("1", "true", "yes", "on")
+        if pause_attack and self.cmd_action in ("attack", "aoe_attack"):
+            self.cmd_action = "none"
+
+        if now - float(getattr(self, "t_last_recovery_log", 0.0)) > 3.0:
+            logger.warning(
+                "[Recovery] Navigating back "
+                f"(elapsed={elapsed:.1f}s route_move={route_has_move} "
+                f"cmd={self.cmd_move_x} {self.cmd_move_y} {self.cmd_action})"
+            )
+            self.t_last_recovery_log = now
+
+        return True
+
+    def update_cmd_by_random(self, allow_jump=False):
+        """Pick a random stuck-recovery action; always move left or right.
+
+        Default allow_jump=False (soft random): left/right only, no down-jump spam.
+        Pass allow_jump=True only when an explicit caller wants jump.
+        """
+        self.cmd_move_x = random.choice(["left", "right"])
+        if allow_jump:
+            self.cmd_move_y = random.choice(["down", "none"])
+            self.cmd_action = random.choice(["jump", "none"])
+        else:
+            self.cmd_move_y = "none"
+            self.cmd_action = "none"
+        logger.warning(
+            "[update_cmd_by_random]"
+            f"{self.cmd_move_x} {self.cmd_move_y} {self.cmd_action}"
+            f" (jump={allow_jump})"
+        )
+
+    def check_reach_goal(self):
+        if self.cmd_action == "goal":
+            # Switch to next route map
+            self.idx_routes = (self.idx_routes+1)%len(self.img_routes)
+            logger.debug(f"Change to new route:{self.idx_routes}")
+
+    def run_once(self):
+        '''
+        Process one game window frame
+        '''
+        # Start profiler for performance debugging
+        self.profiler.start()
+
+        # Check if need viz window
+        self.is_show_debug_window = self.is_need_show_debug_window
+        self._nametag_run_this_frame = None
+
+        ###########################
+        ### Image Preprocessing ###
+        ###########################
+        # Get game window frame
+        img_frame = self.get_img_frame()
+        if img_frame is None:
+            if not is_mac():
+                activate_game_window(self.capture.window_title)
+            return -1 # Wait for game window to be ready
+        else:
+            self.img_frame = img_frame
+
+        # Grayscale only when nametag matching actually needs it this frame.
+        if self._need_frame_gray():
+            self.img_frame_gray = cv2.cvtColor(self.img_frame, cv2.COLOR_BGR2GRAY)
+        else:
+            self.img_frame_gray = None
+
+        # Full-frame copy is expensive; skip when monitor is closed, and when open
+        # only copy on throttled overlay/recording ticks.
+        if self._need_debug_canvas_this_frame():
+            self.img_frame_debug = self.img_frame.copy()
+        else:
+            self.img_frame_debug = None
+
+        # Get current route image
+        if self.cfg["bot"]["mode"] == "normal":
+            self.img_route = self.img_routes[self.idx_routes]
+            self.img_route_debug = cv2.cvtColor(self.img_route, cv2.COLOR_RGB2BGR)
+        else:
+            self.img_route_debug = np.zeros((10, 10, 3), dtype=np.uint8)
+
+        self.profiler.mark("Image Preprocessing")
+
+        ###################
+        ### Get Minimap ###
+        ###################
+        # Get minimap coordinate and size on game window
+        minimap_result = get_minimap_loc_size(self.img_frame)
+        if minimap_result is None:
+            if time.time() - self.t_last_minimap_detection_warning > 5.0:
+                logger.warning(
+                    "Minimap not detected. Keep the top-left minimap expanded "
+                    "and visible."
+                )
+                self.t_last_minimap_detection_warning = time.time()
+            if time.time() - self.t_last_minimap_update > 30:
+                # Unable to get minimap for 30 seconds -> assume it's login screen
+                loc_login_button = self.get_login_button_location()
+                if loc_login_button:
+                    logger.info("Found login button on screen. Proceed to login.")
+                    click_in_game_window(self.capture.window_title,
+                                         loc_login_button)
+                    time.sleep(3)
+                    click_in_game_window(self.capture.window_title,
+                                         self.cfg["ui_coords"]["select_character"])
+                    time.sleep(2)
+        else:
+            x, y, w, h = minimap_result
+            if minimap_result != self.last_minimap_geometry:
+                logger.info(f"[Minimap] Located frame: {minimap_result}")
+                self.last_minimap_geometry = minimap_result
+            # Shrink minimap boardary by one pixel to avoid pixel leaking to minimap
+            x += 1
+            y += 1
+            w -= 2
+            h -= 2
+            # update minimap image
+            self.loc_minimap = (x, y)
+            self.img_minimap = self.img_frame[y:y+h, x:x+w]
+            self.t_last_minimap_update = time.time()
+
+        self.profiler.mark("Get Minimap Location and Size")
+
+        # Update health monitor with current frame
+        self.health_monitor.update_frame(self.img_frame[self.cfg["ui_coords"]["ui_y_start"]:, :])
+
+        #################################
+        ### Player Location Detection ###
+        #################################
+        # Get player location using the configured fallback strategy. Party UI is optional.
+        loc_player = self.get_player_location()
+        self._update_shutdown_lost_monitor(player_found=(loc_player is not None))
+
+        # Update player location
+        if loc_player is not None:
+            # Check if character is on ladder
+            dx = abs(loc_player[0] - self.loc_player[0])
+            dy = abs(loc_player[1] - self.loc_player[1])
+            if self.is_on_ladder:
+                if dx > 3: # Leave ladder if there is horizontal move
+                    self.is_on_ladder = False
+            else:
+                if dx < 3 and dy != 0:
+                    self.is_on_ladder = True
+            # logger.info((self.is_on_ladder, dx, dy))
+            # Update player location
+            self.loc_player = loc_player
+
+        # Draw player center for debugging
+        if self.img_frame_debug is not None:
+            cv2.circle(self.img_frame_debug,
+                    self.loc_player, radius=3,
+                    color=(0, 0, 255), thickness=-1)
+
+        # Get player location on minimap
+        loc_player_minimap = get_player_location_on_minimap(
+                                self.img_minimap,
+                                minimap_player_color=self.cfg["minimap"]["player_color"])
+        if loc_player_minimap:
+            self.loc_player_minimap = loc_player_minimap
+            self.is_player_minimap_detected = True
+        else:
+            self.is_player_minimap_detected = False
+            if time.time() - self.t_last_player_minimap_warning > 5.0:
+                logger.warning(
+                    "[Minimap] Player marker not detected in captured minimap."
+                )
+                self.t_last_player_minimap_warning = time.time()
+
+        # Get other player location on minimap
+        loc_other_players = get_all_other_player_locations_on_minimap(
+                                self.img_minimap,
+                                self.cfg['minimap']['other_player_color'])
+        # Debug
+        # if self.is_first_frame:
+        #     logger.info("Running minimap color analysis...")
+        #     debug_minimap_colors(self.img_minimap, other_player_color)
+
+        # Get player location on global map
+        if self.cfg["bot"]["mode"] in ["patrol", "aux", "smart_patrol"]:
+            self.loc_player_global = self.loc_player_minimap
+        else:
+            self.loc_player_global = self.get_player_location_on_global_map()
+
+        self.profiler.mark("Player Location Detection")
+
+        ######################
+        ### Change Channel ###
+        ######################
+        if self.cfg['channel_change']['enable'] and \
+            self.is_need_change_channel(loc_other_players):
+            self.kb.set_command("none none none")
+            self.kb.release_all_key()
+            self.kb.disable()
+            time.sleep(1)
+            self.channel_change()
+            self.red_dot_center_prev = None
+            return 0
+
+        if self.is_time_to_change_channel():
+            self.kb.set_command("none none none")
+            self.kb.release_all_key()
+            self.kb.disable()
+            time.sleep(1)
+            self.channel_change()
+            return 0
+
+        self.profiler.mark("Change Channel")
+
+        #######################
+        ### Attack WatchDog ###
+        ####################### Check if last attack is timeout
+        dt = time.time() - self.t_last_attack
+        if self.cfg['bot']['mode'] == 'normal' and \
+            dt > self.cfg["watchdog"]["last_attack_timeout"]:
+            logger.info(f"[Attack Timeout] Last attack timeout for {round(dt, 2)} seconds")
+            cfg_action = self.cfg["watchdog"]["last_attack_timeout_action"]
+            if cfg_action == "change_channel":
+                logger.info("[Attack Timeout] Change channel!")
+                self.channel_change()
+            elif cfg_action == "go_home":
+                logger.info("[Attack Timeout] Return home!")
+                press_key(self.cfg["key"]["return_home"])
+                # Terminate Autobot
+                self.is_terminated = True
+                self.kb.is_terminated = True
+            else:
+                logger.info(f"Unsupported timeout mode: {cfg_action}")
+
+        self.profiler.mark("Attack WatchDog")
+
+        ######################
+        ### Hit React (HP) ###
+        ######################
+        # Track HP each frame; HuntingState applies retreat if armed
+        self.update_hit_react_from_hp()
+
+        ######################
+        ### State Behavior ###
+        ######################
+        self.fsm.do_state_stuff()
+
+        self.is_first_frame = False
+
+        self.profiler.mark("State per-frame behavior")
+
+        #####################
+        ### Debug Windows ###
+        #####################
+        # Don't show debug window to save system resource
+        self.debug_ui_updated = False
+        self.route_viz_updated = False
+        if not self.is_show_debug_window:
+            self.t_last_frame = time.time()
+            return 0 # frame done
+
+        now = time.time()
+        # Overlay copy already decided at frame start (_need_debug_canvas_this_frame).
+        if self._debug_canvas_this_frame and self.img_frame_debug is not None:
+            self.update_info_on_img_frame_debug()
+            self.t_last_debug_ui = now
+            self.debug_ui_updated = True
+
+            # Save debug window to video (only when we refresh the overlay)
+            if self.video_writer:
+                self.video_writer.write(self.img_frame_debug)
+
+        # Build a polished display-only route overview. The raw RGB route image
+        # remains untouched because its exact pixels drive navigation.
+        if self.cfg["bot"]["mode"] == "normal":
+            route_viz_fps = max(
+                1.0,
+                float(self.cfg["system"].get(
+                    "fps_limit_route_visualization", 5
+                )),
+            )
+            if now - self.t_last_route_viz >= 1.0 / route_viz_fps:
+                route_bgr = cv2.cvtColor(self.img_route, cv2.COLOR_RGB2BGR)
+                route_actions = dict(self.color_code)
+                route_actions.update(self.color_code_up_down)
+                viewport = (
+                    self.loc_minimap_global[0],
+                    self.loc_minimap_global[1],
+                    self.img_minimap.shape[1],
+                    self.img_minimap.shape[0],
+                )
+                self.img_route_viz = render_route_visualization(
+                    self.img_map,
+                    route_bgr,
+                    route_actions,
+                    player_position=self.loc_player_global,
+                    viewport=viewport,
+                    current_command=(
+                        f"{self.cmd_move_x} {self.cmd_move_y} {self.cmd_action}"
+                    ),
+                    scale=self.cfg["minimap"]["debug_window_upscale"],
+                    crop=True,
+                    show_legend=True,
+                )
+                self.img_route_debug = self.img_route_viz
+                self.t_last_route_viz = now
+                self.route_viz_updated = True
+
+        self.profiler.mark("Debug Window Show")
+
+        # Update FPS timer
+        self.t_last_frame = time.time()
+
+        # Print profiler result
+        if self.cfg["profiler"]["enable"] and \
+            self.profiler.total_frames % self.cfg["profiler"]["print_frequency"] == 0:
+            logger.info('\n' + self.profiler.report())
+
+        return 0 # frame done
+
+    def loop(self):
+        '''
+        Auto Bot main loop
+        Only run when call autobot from UI framework and AutoBotController
+        '''
+        # Make sure player is in party
+        if not is_mac() and self.cfg["party_red_bar"].get("enable", False):
+            activate_game_window(self.capture.window_title)
+            time.sleep(0.3)
+            self.ensure_is_in_party()
+
+        while not self.kb.is_terminated:
+
+            t_start = time.time()
+
+            # Process one game window frame
+            self.is_frame_done = False
+            try:
+                ret = self.run_once()
+            except Exception:
+                logger.exception(
+                    "[MapleStoryAutoBot.loop] Frame processing failed; "
+                    "keyboard control has been stopped"
+                )
+                self.kb.disable()
+                self.kb.release_all_key()
+                self.kb.is_terminated = True
+                break
+
+            # Only proceed if the frame is valid
+            if ret == 0:
+                # Draw image on debug window (throttled + downscaled for Qt)
+                if self.is_show_debug_window and self.is_ui:
+                    if self.debug_ui_updated and self.img_frame_debug is not None:
+                        ui_y = int(self.cfg["ui_coords"].get("ui_y_start", 610))
+                        frame_emit = self.img_frame_debug[:ui_y, :]
+                        scale = float(self.cfg["system"].get("debug_ui_scale", 0.5))
+                        if 0.1 <= scale < 0.999:
+                            frame_emit = cv2.resize(
+                                frame_emit,
+                                None,
+                                fx=scale,
+                                fy=scale,
+                                interpolation=cv2.INTER_AREA,
+                            )
+                        else:
+                            frame_emit = frame_emit.copy()
+                        self.image_debug_signal.emit(frame_emit)
+                    if self.route_viz_updated and self.img_route_viz is not None:
+                        self.route_map_viz_signal.emit(self.img_route_viz.copy())
+            else:
+                pass
+                # logger.warning("Skipped debug window update due to invalid frame.")
+
+            self.is_frame_done = True
+
+            # Cap FPS to save system resource
+            frame_duration = time.time() - t_start
+            fps_limit_main = float(self.cfg["system"].get("fps_limit_main", 20) or 20)
+            target_duration = 1.0 / max(1.0, fps_limit_main)
+            # Sleep only if this tick finished early; heavy frames are never padded.
+            if frame_duration < target_duration:
+                time.sleep(target_duration - frame_duration)
+
+def main(args):
+    '''
+    This main function works as a fake autoBotController
+    This function will only be called when the using terminal to
+    run this script
+    '''
+    #####################
+    ### Init Auto Bot ###
+    #####################
+    try:
+        mapleStoryAutoBot = MapleStoryAutoBot(args)
+    except Exception as e:
+        logger.error(f"MapleStoryAutoBot Init failed: {e}")
+        sys.exit(1)
+    else:
+        logger.info("MapleStoryAutoBot Init Successfully")
+
+    ####################
+    ### Apply Config ###
+    ####################
+    # Load defautl yaml config
+    cfg = load_yaml("config/config_default.yaml")
+    # Override with platform config
+    if is_mac():
+        cfg = override_cfg(cfg, load_yaml("config/config_macOS.yaml"))
+    # Override with user customized config
+    cfg = override_cfg(cfg, load_yaml(f"config/config_{args.cfg}.yaml"))
+    # Dump config to log for debugging
+    logger.debug(yaml.dump(cfg, sort_keys=False,
+                 indent=2, default_flow_style=False))
+    # autoBot load config
+    mapleStoryAutoBot.load_config(cfg)
+
+    #####################
+    ### Start AutoBot ###
+    #####################
+    try:
+        mapleStoryAutoBot.start() # Start all threads in autoBot
+    except Exception as e:
+        logger.error(f"MapleStoryAutoBot start failed: {e}")
+        mapleStoryAutoBot.terminate_threads() # Terminate all threads
+        sys.exit(1)
+    else:
+        logger.info("MapleStoryAutoBot Start Successfully")
+
+    # Start record game window for debugging
+    if args.record:
+        mapleStoryAutoBot.start_record()
+
+    kb_listener = KeyBoardListener(is_autobot=True)
+    kb_listener.register_func_key_handler('f1', mapleStoryAutoBot.kb.toggle_enable)
+    kb_listener.register_func_key_handler('f2', mapleStoryAutoBot.screenshot_img_frame)
+    kb_listener.register_func_key_handler('f12', mapleStoryAutoBot.terminate_threads)
+
+    # While loop
+    while not mapleStoryAutoBot.is_terminated:
+        # Show debug image on window
+        if mapleStoryAutoBot.is_frame_done:
+            if mapleStoryAutoBot.img_frame_debug is not None:
+                cv2.imshow("Game Window Debug",
+                    mapleStoryAutoBot.img_frame_debug[:
+                        mapleStoryAutoBot.cfg["ui_coords"]["ui_y_start"], :])
+
+            if mapleStoryAutoBot.img_route_debug is not None:
+                cv2.imshow("Route Map Debug", mapleStoryAutoBot.img_route_debug)
+
+        cv2.waitKey(1)
+
+        time.sleep(0.01)
+
+    #########################
+    ### Terminate AutoBot ###
+    #########################
+    mapleStoryAutoBot.terminate_threads() # Terminate all threads
+
+    cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--disable_control',
+        action='store_true',
+        help='Disable simulated keyboard input'
+    )
+
+    parser.add_argument(
+        '--cfg',
+        type=str,
+        default='custom',
+        help='Choose customized config yaml file in config/'
+    )
+
+    parser.add_argument(
+        '--debug',
+        action="store_true",
+        help="Enable debug logging"
+    )
+
+    parser.add_argument(
+        '--record',
+        action="store_true",
+        help="Record debug window"
+    )
+
+    parser.add_argument(
+        '--disable_viz',
+        action="store_true",
+        help="Disable viz debug window"
+    )
+
+    parser.add_argument(
+        '--test_image',
+        default="",
+        help="Pass in image in test/XXX.png"
+    )
+
+    parser.add_argument(
+        '--init_state',
+        default="",
+        help="choose the init_state"
+    )
+
+    args = parser.parse_args()
+    args.is_ui = False # Always set False for command line
+
+    # Set logger level
+    if args.debug:
+        logger.set_level(logging.DEBUG)
+
+    main(args)

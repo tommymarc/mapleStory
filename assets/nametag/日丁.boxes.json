@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "size": [
+    116,
+    69
+  ],
+  "layers": 3,
+  "name": [
+    26,
+    4,
+    67,
+    20
+  ],
+  "guild": [
+    28,
+    25,
+    58,
+    22
+  ],
+  "guild_text": [
+    32,
+    30,
+    50,
+    12
+  ],
+  "medal": [
+    5,
+    50,
+    104,
+    13
+  ],
+  "second_kind": "guild",
+  "bands": {
+    "name": [
+      3,
+      25
+    ],
+    "guild": [
+      24,
+      48
+    ],
+    "medal": [
+      49,
+      64
+    ]
+  },
+  "guild_dy": 24,
+  "source_scale": "native"
+}

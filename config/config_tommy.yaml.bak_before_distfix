@@ -1,0 +1,29 @@
+bot:
+  jump_attack: false
+  map: yezhulingtu
+  mode: smart_patrol
+directional_attack:
+  cooldown: 0.2
+  range_x: 130
+  range_y: 80
+health_monitor:
+  add_hp_percent: 40
+  add_mp_percent: 10
+hybrid_attack:
+  aoe_cooldown: 0.2
+nametag:
+  enable: true
+  hold_good_frames: 12
+  hold_good_score_max: 0.12
+  jump_reject_score: 0.15
+  layers: 3
+  max_jump_y: 30
+  name: 日丁
+  offset:
+  - 0
+  - 24
+  reacquire_after_misses: 2
+  verify_require_track_score: 0.18
+shutdown_monitor:
+  lost_seconds: 120
+  timed_at: 05:00

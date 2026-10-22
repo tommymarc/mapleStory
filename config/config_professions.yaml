@@ -1,0 +1,49 @@
+version: 2
+selected_profession: ""
+professions:
+  冰雷:
+    bindings:
+      add_hp: a
+      add_mp: s
+      aoe_attack: c
+      buff: b
+      dialog: f
+      jump: space
+      main_attack: x
+      pet_food: '`'
+      x_axis_movement: v
+    intervals:
+      buff: 50
+      experience_coupon: 3600
+      pet_food: 180
+    main_attack_type: hybrid
+  战士:
+    bindings:
+      add_hp: a
+      add_mp: s
+      aoe_attack: c
+      buff: b
+      dialog: f
+      jump: space
+      main_attack: x
+      pet_food: '`'
+    intervals:
+      buff: 60
+      experience_coupon: 70
+      pet_food: 600
+    jump_attack: false
+    main_attack_type: hybrid
+  法师:
+    bindings:
+      add_hp: a
+      add_mp: s
+      aoe_attack: c
+      dialog: f
+      jump: space
+      main_attack: x
+      pet_food: '`'
+    intervals:
+      buff: 60
+      experience_coupon: 3600
+      pet_food: 600
+    main_attack_type: directional

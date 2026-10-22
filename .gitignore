@@ -1,0 +1,17 @@
+build/
+screenshot/
+video/
+log/
+dist/
+*__pycache__/
+*.log
+*.DS_Store
+*.prof
+*.config_tmp.yaml
+*config_custom.yaml
+*.exe
+# keep the one canonical packaging spec tracked
+*.spec
+!MapleStoryAutoLevelUp.spec
+.venv/
+venv/

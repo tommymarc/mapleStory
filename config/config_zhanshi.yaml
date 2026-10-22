@@ -1,0 +1,40 @@
+aoe_skill:
+  range_x: 320
+  range_y: 140
+bot:
+  map: dongbuyanshan5-shang
+  mode: aux
+directional_attack:
+  character_turn_delay: 0.08
+  cooldown: 0.3
+  range_x: 180
+game_window:
+  title: "冒险岛怀旧服"
+health_monitor:
+  add_hp_cooldown: 2.5
+  add_hp_percent: 35
+  add_mp_cooldown: 3.0
+  add_mp_percent: 10
+  fps_limit: 8
+  potion_profile:
+    add_hp_max: 2128
+    add_hp_potion_amount: 150
+    add_mp_max: 295
+    add_mp_potion_amount: 300
+hybrid_attack:
+  aoe_cooldown: 0.9
+nametag:
+  enable: true
+  name: 雀雀被雷电
+watchdog:
+  timeout: 16
+
+recovery:
+  enable: true
+  pause_attack: true
+  prefer_route: true
+  random_after_sec: 8
+  halt_after_sec: 45
+  random_allow_jump: false
+  min_duration_sec: 6
+  clear_stuck_grace_sec: 3
